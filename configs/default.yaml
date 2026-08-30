@@ -1,0 +1,144 @@
+# =============================================================================
+# Fencing AI — Modern Pipeline Configuration
+# =============================================================================
+# Override any value from CLI:  python -m src.train training.lr=5e-4
+
+# --- Data -------------------------------------------------------------------
+data:
+  # Target weapon mode: 'foil' | 'sabre' | 'epee' | 'multi'
+  weapon: "${oc.env:FENCING_WEAPON,foil}"
+  # Path to directory containing .mp4 clips with filename prefix labels (L/R/T)
+  clips_dir: "${oc.env:FENCING_CLIPS_DIR,data/clips/foil}"
+  # Legacy static flipped directory (false by default: on-the-fly dynamic flip is used)
+  include_flipped: false
+  flipped_dir: "${oc.env:FENCING_FLIPPED_DIR,more_training_data}"
+
+  # Number of frames to sample per clip (must match model expectation)
+  num_frames: 16
+  # Spatial resolution fed to the model
+  frame_size: 224
+
+  # Train / val / test split ratios
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+  # Random seed for reproducible splits
+  split_seed: 42
+
+  # Max clips to load (null = all). Useful for smoke tests.
+  max_clips: null
+
+  # DataLoader workers (0 = main process; safe default for macOS)
+  num_workers: 0
+  pin_memory: false
+
+  # Temporal sampling strategy: 'end_weighted' (heavier sampling at the final blade clash) or 'uniform'
+  sampling_mode: "end_weighted"
+
+# --- Model -------------------------------------------------------------------
+model:
+  # HuggingFace model identifier
+  backbone: "MCG-NJU/videomae-base-finetuned-kinetics"
+
+  # Freeze the backbone base
+  freeze_backbone: true
+
+  # LoRA fine-tuning on top spatio-temporal attention blocks
+  use_lora: true
+  lora:
+    r: 8
+    alpha: 16
+    layers:
+      - 8
+      - 9
+      - 10
+      - 11
+
+  # Classification head config
+  head:
+    hidden_dim: 256
+    dropout: 0.3
+    num_classes: 3
+
+  # Class names (order matters — must match label encoding)
+  class_names:
+    - "Left"
+    - "Tie"
+    - "Right"
+
+# --- Training ----------------------------------------------------------------
+training:
+  batch_size: 4
+  epochs: 20
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"        # cosine | step | none
+    warmup_epochs: 3
+    min_lr: 1.0e-6
+
+  # Mixed precision (float16) — reduces memory, may speed up on MPS
+  mixed_precision: true
+
+  # Gradient clipping max norm
+  grad_clip_norm: 1.0
+
+  # Early stopping (patience in epochs; 0 = disabled)
+  early_stopping_patience: 6
+
+  # Save best model checkpoint
+  checkpoint_dir: "checkpoints"
+
+  # Device preference: auto | mps | cuda | cpu
+  device: "auto"
+
+# --- Augmentation ------------------------------------------------------------
+augmentation:
+  # Training augmentations
+  train:
+    random_resized_crop:
+      enabled: true
+      scale: [0.8, 1.0]
+    horizontal_flip:
+      enabled: true
+      prob: 0.5
+    color_jitter:
+      enabled: true
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.05
+    random_grayscale:
+      enabled: false
+      prob: 0.1
+    temporal_jitter:
+      enabled: true
+      # Max frames to shift the sampling start position
+      max_shift: 2
+
+  # Validation/test augmentations (deterministic)
+  eval:
+    center_crop: true
+
+# --- Weights & Biases --------------------------------------------------------
+wandb:
+  enabled: true
+  project: "fencing-ai"
+  entity: "inter-glm"     # Team entity on Weights & Biases
+  run_name: null          # null = auto-generated
+  tags:
+    - "foil"
+    - "lora"
+    - "videomae"
+  # How often to log misclassified samples (in epochs)
+  log_media_every_n_epochs: 2
+  # Max misclassified samples to log per validation
+  max_misclassified_samples: 24
+
+# --- Hydra -------------------------------------------------------------------
+hydra:
+  run:
+    dir: "outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}"

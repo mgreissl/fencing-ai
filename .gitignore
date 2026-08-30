@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+
+# OS-specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# Experiment Tracking & Logs
+wandb/
+outputs/
+*.log
+
+# Checkpoints and Weights
+checkpoints/
+*.pt
+*.pth
+*.h5
+*.pb
+*.hkl
+
+# Data & Video Clips
+data/
+precut*/
+*.mp4
+*.mkv
+*.avi
+temp_cut_clips/
+final_training_clips/
+final_training_data/
+more_training_data/
+training_data/
+training_quarantine/
+optical_flow/
+preinception_data/
+
+# Secrets & Local Configs
+.netrc
+.env

@@ -1,36 +1,76 @@
-from pytubefix import Playlist
-import ssl
-ssl._create_default_https_context = ssl._create_stdlib_context
+#!/usr/bin/env python3
+"""
+0-find_vids.py — Fetch match video URLs from YouTube playlists using yt-dlp or pytube.
 
-def save_playlist_links(playlist_urls, output_file):
-    # Open the output file in write mode
-    with open(output_file, 'w') as file:
-        # Iterate over each playlist URL
-        for playlist_url in playlist_urls:
-            try:
-                # Create a Playlist object for each URL
-                playlist = Playlist(playlist_url)
+Usage:
+    python 0-find_vids.py --weapon foil
+    python 0-find_vids.py --weapon sabre
+"""
 
-                print(f"Fetching links from playlist: {playlist.title}")
+import argparse
+import subprocess as sp
+import os
 
-                # Write each video's URL to the file
-                for video in playlist.videos:
-                    file.write(video.watch_url + '\n')
-
-                print(f"Saved {len(playlist.video_urls)} links from {playlist.title}")
-
-            except Exception as e:
-                print(f"Failed to process playlist: {playlist_url}\nError: {e}")
-
-    print(f"All links saved to {output_file}")
+PLAYLISTS = {
+    "foil": [
+        "https://www.youtube.com/playlist?list=PL_pQQho0KExyKIiybGuSbwqhJtyMWWXBZ",
+        "https://www.youtube.com/playlist?list=PL_pQQho0KExwQU4aN2RxG5sTYK2OKB4Wb",
+        "https://www.youtube.com/playlist?list=PL_pQQho0KExx2pdA0cdzmz4UB3hp3CfzX",
+    ],
+    "sabre": [
+        "https://www.youtube.com/playlist?list=PL_pQQho0KExzE6Y6E8w8rL1g8Z8N_e7Lh",
+    ]
+}
 
 
-# Define YouTube playlist URLs
-playlist_urls = [
-    'https://www.youtube.com/playlist?list=PL_pQQho0KExyKIiybGuSbwqhJtyMWWXBZ', # Milano 2023 Men's Foil Individual Word Cup
-    'https://www.youtube.com/playlist?list=PL_pQQho0KExwQU4aN2RxG5sTYK2OKB4Wb', # 2022 Bonn GER Men's Foil Individual World Cup
-]
+def fetch_playlist_urls(playlist_url):
+    """Extract individual video URLs from a YouTube playlist using yt-dlp."""
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "--print", "url",
+        playlist_url
+    ]
+    try:
+        res = sp.run(cmd, capture_output=True, text=True, check=True)
+        return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+    except Exception as e:
+        print(f"Warning: yt-dlp failed on {playlist_url}: {e}")
+        return []
 
-output_file = 'foil_videos.txt'
 
-save_playlist_links(playlist_urls, output_file)
+def main():
+    parser = argparse.ArgumentParser(description="Extract video URLs from fencing playlists")
+    parser.add_argument("--weapon", choices=["foil", "sabre"], default="foil", help="Target weapon")
+    parser.add_argument("--output", type=str, default=None, help="Output file path")
+    args = parser.parse_args()
+
+    out_file = args.output or f"{args.weapon}_videos.txt"
+    playlists = PLAYLISTS.get(args.weapon, [])
+
+    existing_urls = set()
+    if os.path.exists(out_file):
+        with open(out_file) as f:
+            existing_urls = set(line.strip() for line in f if line.strip().startswith("http"))
+
+    all_urls = list(existing_urls)
+    new_count = 0
+
+    for pl in playlists:
+        print(f"Fetching: {pl}")
+        urls = fetch_playlist_urls(pl)
+        for u in urls:
+            if u not in existing_urls:
+                all_urls.append(u)
+                existing_urls.add(u)
+                new_count += 1
+
+    with open(out_file, "w") as f:
+        for u in all_urls:
+            f.write(u + "\n")
+
+    print(f"Done! {out_file} has {len(all_urls)} total URLs (+{new_count} new).")
+
+
+if __name__ == "__main__":
+    main()
