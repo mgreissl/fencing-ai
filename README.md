@@ -7,7 +7,7 @@ An automated computer vision system for referee decision prediction in Olympic f
 ---
 
 ## 1. Background: Priority (Right of Way) in Foil
-Unlike Épée—where points are determined solely by electrical contact timing and double-touches award points to both competitors—Foil (and Sabre) have conventional rules of Right of Way (Priorité):
+Unlike Épée—where points are determined solely by electrical contact timing and double-touches award points to both competitors—Foil (and Sabre) have conventional rules of Right of Way (Priorité) [3]:
 
 * **Initiation & The Attack:** The fencer who first begins an offensive movement (characterized by arm extension continuously threatening the opponent's valid torso target while advancing) possesses priority.
 * **The Parry-Riposte:** A defender cannot simply hit into an attack. To gain priority, the defender must first deflect the incoming blade (Parry). A successful parry extinguishes the opponent's attack and confers priority to the defender's return touch (Riposte).
@@ -22,8 +22,8 @@ The Computer Vision Challenge: An automated referee cannot rely solely on the ap
 
 This project expands upon work by Sholto Douglas in [SholtoD/fencing-AI](https://github.com/SholtoD/fencing-AI). 
 
-- **Spatio-Temporal Representation**: Leverages a pre-trained **VideoMAE-Base** (3D Vision Transformer) operating on spacetime tubelet patches ($16 \times 16 \times 2$), capturing high-velocity blade contacts directly without hand-crafted optical flow.
-- **Parameter-Efficient Fine-Tuning**: Rank-8 LoRA adapters applied to query/value projections across layers 8–11 update only **0.58%** of model weights (~501K parameters).
+- **Spatio-Temporal Representation**: Leverages a pre-trained **VideoMAE** [1] (3D Vision Transformer) operating on spacetime tubelet patches ($16 \times 16 \times 2$).
+- **Parameter-Efficient Fine-Tuning**: Rank-8 LoRA adapters applied to query/value projections across layers 8–11 update only **0.58%** of model weights (~501K parameters) [2].
 - **Bilateral Spatial-Difference Pooling**: Resolves left-right orientation symmetry collapse by extracting global scene context combined with lateral difference features:
   $$\mathbf{z} = \left[ \mathbf{z}_{\text{global}}, \; \mathbf{z}_{\text{left}} - \mathbf{z}_{\text{right}} \right] \in \mathbb{R}^{1536}$$
   This feature representation is mathematically anti-symmetric under horizontal reflections ($\mathbf{z}_{\text{diff}} \to -\mathbf{z}_{\text{diff}}$), enforcing robust separation between Left and Right touches.
@@ -80,3 +80,13 @@ python 6-train_AI.py data.weapon=multi training.epochs=25 training.batch_size=4
 # Evaluate checkpoint against held-out test distribution
 python 7-evaluate_AI.py data.weapon=foil
 ```
+
+---
+
+## 6. References
+
+[1] Tong, Z., Song, Y., Wang, J., & Wang, L. (2022). *VideoMAE: Masked Autoencoders are Data-Efficient Learners for Self-Supervised Video Pre-Training.* NeurIPS 2022. [[arXiv:2203.12602]](https://arxiv.org/abs/2203.12602)
+
+[2] Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., & Chen, W. (2022). *LoRA: Low-Rank Adaptation of Large Language Models.* ICLR 2022. [[arXiv:2106.09685]](https://arxiv.org/abs/2106.09685)
+
+[3] Fédération Internationale d'Escrime. *Technical Rules.* [[fie.org]](https://fie.org/fie/documents/rules)
