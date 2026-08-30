@@ -11,10 +11,6 @@ import argparse
 import os
 import subprocess as sp
 
-DIRECTORIES = ["precut", "final_training_clips", "more_training_data"]
-for d in DIRECTORIES:
-    os.makedirs(d, exist_ok=True)
-
 
 def download_video(url, output_dir):
     """Download a match video in 360p mp4 format."""

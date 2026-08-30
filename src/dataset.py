@@ -150,10 +150,6 @@ def _sample_frame_indices(
     indices = sorted([max(0, min(i, total_frames - 1)) for i in indices])
     return indices
 
-    # Clamp to valid range
-    indices = [max(0, min(i, total_frames - 1)) for i in indices]
-    return indices
-
 
 def _get_total_frames(path: str) -> int:
     """Get the total frame count of a video."""

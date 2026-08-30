@@ -208,24 +208,9 @@ def log_results_to_wandb(
 
 def _extract_thumbnail(path: str) -> "Image.Image":
     """Extract the middle frame from a video as a PIL Image."""
-    from PIL import Image
+    from src.utils import extract_thumbnail
 
-    try:
-        from decord import VideoReader, cpu
-
-        vr = VideoReader(path, ctx=cpu(0))
-        mid_idx = len(vr) // 2
-        frame = vr[mid_idx].asnumpy()
-        return Image.fromarray(frame)
-    except ImportError:
-        import av
-
-        container = av.open(path)
-        frames = [f for f in container.decode(container.streams.video[0])]
-        container.close()
-        mid_idx = len(frames) // 2
-        frame = frames[mid_idx].to_ndarray(format="rgb24")
-        return Image.fromarray(frame)
+    return extract_thumbnail(path)
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="default")
