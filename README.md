@@ -179,6 +179,18 @@ python -m src bootstrap a/predictions_test.csv --compare b/predictions_test.csv
 
 Options: `--n-boot` (default 2000), `--seed`.
 
+### Label Audit
+
+The labels come from scoreboard OCR and carry an unknown noise rate (#11). Draw a stratified sample, label it by hand, then estimate noise rates:
+
+```bash
+python -m src audit-sample --manifest data/clips/foil/manifest.csv --n-clips 200
+# fill human_label in audit/audit_sheet.csv (L/T/R, X = not identifiable); review clips via audit/index.html
+python -m src audit-report --sheet audit/audit_sheet.csv --output-json audit/report.json
+```
+
+`audit-report` prints per-class and per-weapon noise rates with Wilson 95% intervals and the confusion matrix (human vs. automatic label).
+
 ---
 
 ## 6. Data Source and Usage Restrictions
