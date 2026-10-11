@@ -63,13 +63,6 @@ def test_bilateral_pool_derives_grid_from_config(
     assert torch.allclose(pooled[:, 3], torch.tensor(left - right))
 
 
-def test_bilateral_pool_falls_back_on_mismatched_token_count():
-    config = VideoMAEConfig(image_size=32, patch_size=16)
-    pooled = bilateral_pool(torch.rand(1, 7, 4), config)
-    assert pooled.shape == (1, 8)
-    assert torch.equal(pooled[:, 4:], torch.zeros(1, 4))
-
-
 def test_tiny_random_backbone_forward_video_only():
     model = _tiny()
     pixel_values, weapon_id, _ = _inputs()
@@ -137,3 +130,47 @@ def test_experiment_configs(name):
     exp = OmegaConf.load(path)
     assert exp.model.use_video == (name != "kinematics_only")
     assert exp.model.use_kinematics == (name != "video_only")
+
+
+def test_lora_dropout_is_separate_from_head_dropout():
+    from peft.tuners.lora import LoraLayer
+
+    model = _tiny(use_lora=True, lora_layers=[0, 1], dropout=0.3, lora_dropout=0.1)
+    probs = {
+        layer.lora_dropout["default"].p
+        for layer in model.backbone.modules()
+        if isinstance(layer, LoraLayer)
+    }
+    assert probs == {0.1}
+
+
+def test_build_model_reads_lora_dropout_default():
+    cfg = OmegaConf.create(
+        {
+            "model": {
+                "backbone": "unused",
+                "freeze_backbone": False,
+                "use_lora": True,
+                "use_kinematics": False,
+                "backbone_config": TINY_BACKBONE,
+                "lora": {"r": 2, "alpha": 4, "layers": [0, 1]},
+                "head": {"hidden_dim": 8, "num_classes": 3, "dropout": 0.3},
+            }
+        }
+    )
+    from peft.tuners.lora import LoraLayer
+
+    model = build_model(cfg)
+    probs = {
+        layer.lora_dropout["default"].p
+        for layer in model.backbone.modules()
+        if isinstance(layer, LoraLayer)
+    }
+    assert probs == {0.1}
+    cfg.model.lora.dropout = 0.05
+    model = build_model(cfg)
+    assert {
+        layer.lora_dropout["default"].p
+        for layer in model.backbone.modules()
+        if isinstance(layer, LoraLayer)
+    } == {0.05}

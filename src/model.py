@@ -167,6 +167,7 @@ class FencingVideoMAE(nn.Module):
         lora_r: int = 8,
         lora_alpha: int = 16,
         lora_layers: list = None,
+        lora_dropout: float = 0.1,
         hidden_dim: int = 256,
         num_classes: int = 3,
         dropout: float = 0.3,
@@ -196,7 +197,7 @@ class FencingVideoMAE(nn.Module):
                 lora_r,
                 lora_alpha,
                 lora_layers,
-                dropout,
+                lora_dropout,
             )
         else:
             log.info("Video stream disabled: kinematics-only classifier")
@@ -245,7 +246,7 @@ class FencingVideoMAE(nn.Module):
         lora_r,
         lora_alpha,
         lora_layers,
-        dropout,
+        lora_dropout,
     ):
         if backbone_config:
             # Randomly initialised backbone from an explicit config (no download)
@@ -274,7 +275,7 @@ class FencingVideoMAE(nn.Module):
                 lora_alpha=lora_alpha,
                 target_modules=["query", "value"],
                 layers_to_transform=lora_layers,
-                lora_dropout=dropout,
+                lora_dropout=lora_dropout,
                 bias="none",
             )
             self.backbone = get_peft_model(base_videomae, lora_config)
@@ -366,6 +367,7 @@ def build_model(cfg) -> FencingVideoMAE:
     lora_r = getattr(cfg.model.lora, "r", 8) if hasattr(cfg.model, "lora") else 8
     lora_alpha = getattr(cfg.model.lora, "alpha", 16) if hasattr(cfg.model, "lora") else 16
     lora_layers = list(getattr(cfg.model.lora, "layers", [8, 9, 10, 11])) if hasattr(cfg.model, "lora") else [8, 9, 10, 11]
+    lora_dropout = getattr(cfg.model.lora, "dropout", 0.1) if hasattr(cfg.model, "lora") else 0.1
 
     use_kinematics = getattr(cfg.model, "use_kinematics", False)
     kin_in = getattr(cfg.model.kinematics, "feature_dim", KINEMATIC_FEATURE_DIM) if hasattr(cfg.model, "kinematics") else KINEMATIC_FEATURE_DIM
@@ -385,6 +387,7 @@ def build_model(cfg) -> FencingVideoMAE:
         lora_r=lora_r,
         lora_alpha=lora_alpha,
         lora_layers=lora_layers,
+        lora_dropout=lora_dropout,
         hidden_dim=cfg.model.head.hidden_dim,
         num_classes=cfg.model.head.num_classes,
         dropout=cfg.model.head.dropout,

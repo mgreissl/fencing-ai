@@ -84,6 +84,8 @@ model:
   lora:
     r: 8
     alpha: 16
+    # Dropout inside the LoRA adapters (independent of the head dropout)
+    dropout: 0.1
     layers:
       - 8
       - 9
