@@ -12,20 +12,23 @@ Processes match video URLs from {weapon}_videos.txt:
 
 import argparse
 import os
-import re
-import cv2
 import pickle
+import sys
+import cv2
 import subprocess as sp
 import numpy as np
 import time
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
-# Template images for light detection (640x360 coordinates)
+from src import overlay  # noqa: E402
+
+# Overlay geometry/thresholds: single source of truth in configs/overlay/.
+OVERLAY = overlay.load_overlay(overlay.DEFAULT_OVERLAY)
+
 RESOURCES_DIR = os.path.join(BASE_DIR, "resources")
-GREEN_BOX = cv2.imread(os.path.join(RESOURCES_DIR, "greenbox.png"))
-RED_BOX = cv2.imread(os.path.join(RESOURCES_DIR, "redbox.png"))
-WHITE_BOX = cv2.imread(os.path.join(RESOURCES_DIR, "whitebox.png"))
 
 # Load logistic regression digit classifier (trained for scoreboard numbers 0-15)
 CLASSIFIER_PATH = os.path.join(RESOURCES_DIR, "logistic_classifier_0-15.pkl")
@@ -41,31 +44,12 @@ HIDE_LENGTH = 200
 
 def check_lights(frame, weapon="foil"):
     """Check whether left/right on-target or off-target lights are lit."""
-    string = ""
-    # Left on target (red)
-    if np.sum(abs(frame[330:334, 140:260].astype(int) - RED_BOX.astype(int))) <= 40000:
-        string += "On"
-    elif weapon == "foil" and np.sum(abs(frame[337:348, 234:250].astype(int) - WHITE_BOX.astype(int))) <= 7000:
-        string += "Off"
-    else:
-        string += "No"
-
-    string += "-"
-    # Right on target (green)
-    if np.sum(abs(frame[330:334, 380:500].astype(int) - GREEN_BOX.astype(int))) <= 40000:
-        string += "On"
-    elif weapon == "foil" and np.sum(abs(frame[337:348, 390:406].astype(int) - WHITE_BOX.astype(int))) <= 7000:
-        string += "Off"
-    else:
-        string += "No"
-
-    return string
+    return overlay.check_lights(frame, OVERLAY, weapon)
 
 
 def check_score(frame):
     """Predict left and right fencer scores from scoreboard crops."""
-    left_crop = frame[309:325, 265:285].reshape(1, -1)
-    right_crop = frame[309:325, 355:375].reshape(1, -1)
+    left_crop, right_crop = overlay.score_crops(frame, OVERLAY)
     left_score = int(SCORE_MODEL.predict(left_crop)[0])
     right_score = int(SCORE_MODEL.predict(right_crop)[0])
     return left_score, right_score
@@ -135,14 +119,7 @@ def process_video_file(vid_path, output_dir, weapon="foil"):
 
         # Check for light illumination
         try:
-            is_light = (
-                (weapon == "foil" and (
-                    np.sum(abs(frame[337:348, 234:250].astype(int) - WHITE_BOX.astype(int))) <= 7000 or
-                    np.sum(abs(frame[337:348, 390:406].astype(int) - WHITE_BOX.astype(int))) <= 7000
-                )) or
-                np.sum(abs(frame[330:334, 380:500].astype(int) - GREEN_BOX.astype(int))) <= 40000 or
-                np.sum(abs(frame[330:334, 140:260].astype(int) - RED_BOX.astype(int))) <= 40000
-            )
+            is_light = overlay.any_light(frame, OVERLAY, weapon)
         except Exception:
             is_light = False
 

@@ -24,12 +24,20 @@ import os
 import pickle
 import re
 import subprocess as sp
+import sys
 import time
 import cv2
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from src import overlay  # noqa: E402
+
+# Overlay geometry/thresholds: single source of truth in configs/overlay/.
+OVERLAY = overlay.load_overlay(overlay.DEFAULT_OVERLAY)
 
 RESOURCES_DIR = os.path.join(BASE_DIR, "resources")
 CLASSIFIER_PATH = os.path.join(RESOURCES_DIR, "logistic_classifier_0-15.pkl")
@@ -99,26 +107,19 @@ def check_video_overlay(url):
 
         frame = np.frombuffer(p_ff.stdout, dtype=np.uint8).reshape((360, 640, 3))
 
-        # 1. Header bar intensity check (classic template has dark slate header < 100)
-        header_mean = float(np.mean(frame[300:305, 200:440]))
-        if header_mean > 100:
-            return False, f"No dark header (mean={header_mean:.1f} > 100)"
-
-        # 2. Light boxes unlit region check
-        light_l = float(np.mean(frame[330:334, 140:260]))
-        light_r = float(np.mean(frame[330:334, 380:500]))
-        if light_l > 115 or light_r > 115:
-            return False, f"Light regions too bright ({light_l:.1f}, {light_r:.1f})"
+        # 1.+2. Dark header bar and unlit light boxes
+        overlay_ok, overlay_reason = overlay.probe_frame(frame, OVERLAY)
+        if not overlay_ok:
+            return False, overlay_reason
 
         # 3. Score crops validity
-        l_crop = frame[309:325, 265:285].reshape(1, -1)
-        r_crop = frame[309:325, 355:375].reshape(1, -1)
+        l_crop, r_crop = overlay.score_crops(frame, OVERLAY)
         s_l = int(SCORE_MODEL.predict(l_crop)[0])
         s_r = int(SCORE_MODEL.predict(r_crop)[0])
         if not (0 <= s_l <= 15 and 0 <= s_r <= 15):
             return False, f"Invalid scores ({s_l}, {s_r})"
 
-        return True, f"Valid overlay (header={header_mean:.1f}, scores={s_l}-{s_r})"
+        return True, f"Valid overlay ({overlay_reason}, scores={s_l}-{s_r})"
     except sp.TimeoutExpired:
         return None, "Network error: Timeout probing stream"
     except Exception as e:

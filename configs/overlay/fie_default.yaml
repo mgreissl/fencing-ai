@@ -1,0 +1,50 @@
+# Overlay geometry and thresholds for the default FIE broadcast template
+# (FencingVision / FIE YouTube streams, 360p, 640x360 after resizing).
+#
+# Single source of truth: loaded by src/overlay.py and used by
+# scripts/preprocess_pipeline.py and scripts/harvest_fencingvision.py.
+#
+# All regions are [y0, y1, x0, x1] in pixel coordinates of a frame of size
+# `frame_size`, half-open like numpy slices: frame[y0:y1, x0:x1].
+name: fie_default
+
+# [width, height] the geometry below refers to. Other frame sizes are resized.
+frame_size: [640, 360]
+
+# Light boxes. `template` is a BGR crop (relative to the repo root) of the
+# lit box; a box counts as lit when the sum of absolute pixel differences to
+# the template is <= max_sad.
+lights:
+  left_on:
+    region: [330, 334, 140, 260]
+    template: resources/redbox.png
+    max_sad: 40000
+  right_on:
+    region: [330, 334, 380, 500]
+    template: resources/greenbox.png
+    max_sad: 40000
+  # Off-target (white) lights exist for foil only.
+  left_off:
+    region: [337, 348, 234, 250]
+    template: resources/whitebox.png
+    max_sad: 7000
+  right_off:
+    region: [337, 348, 390, 406]
+    template: resources/whitebox.png
+    max_sad: 7000
+  # Every row with y >= mask_band_y belongs to the light boxes. Saved clips
+  # keep these rows (the light onset is needed for alignment); the data
+  # pipeline masks them before the model sees a frame.
+  mask_band_y: 330
+
+# Scoreboard digit crops fed to the digit classifier.
+score:
+  left: [309, 325, 265, 285]
+  right: [309, 325, 355, 375]
+
+# Harvest-time overlay probe (dark header bar and unlit light boxes).
+probe:
+  header_region: [300, 305, 200, 440]
+  header_max_mean: 100
+  # Unlit light regions must be darker than this mean pixel value.
+  unlit_max_mean: 115
