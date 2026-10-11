@@ -17,12 +17,15 @@ frame indices the video stream samples. See ``KINEMATIC_FEATURE_NAMES``.
 Also provides broadcast-style AR velocity glow rendering (Olympic "Fencing Visualized" style).
 """
 
+import hashlib
+import json
 import os
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Sequence, Union
 
 # COCO Keypoint indices
@@ -38,7 +41,10 @@ R_HIP = 12
 L_ANKLE = 15
 R_ANKLE = 16
 
-_YOLO_MODEL = None
+_POSE_MODELS: dict = {}
+
+# Bump whenever the feature computation or layout changes; part of the cache key.
+KINEMATIC_FEATURE_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # Feature layout
@@ -106,14 +112,37 @@ def resolve_kinematics_settings(settings: Optional[dict] = None) -> dict:
     return {**DEFAULT_KINEMATICS_SETTINGS, **(settings or {})}
 
 
+def kinematics_settings_hash(settings: Optional[dict] = None) -> str:
+    """Short, stable hash of the resolved settings and ``KINEMATIC_FEATURE_VERSION``."""
+    payload = {**resolve_kinematics_settings(settings), "feature_version": KINEMATIC_FEATURE_VERSION}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:10]
+
+
+def kinematics_cache_path(
+    cache_dir: Union[str, os.PathLike],
+    clip_path: Union[str, os.PathLike],
+    settings: Optional[dict] = None,
+) -> Path:
+    """
+    Cache file for the full-rate features of a clip.
+
+    Layout: ``{cache_dir}/v{version}_{pose_model}_{settings_hash}/{clip_stem}.npy``.
+    Any change of the pose model, a feature setting or the feature version
+    yields a new directory, so stale features are never reused.
+    """
+    cfg = resolve_kinematics_settings(settings)
+    tag = f"v{KINEMATIC_FEATURE_VERSION}_{Path(cfg['pose_model']).stem}_{kinematics_settings_hash(cfg)}"
+    return Path(cache_dir) / tag / f"{Path(clip_path).stem}.npy"
+
+
 def get_pose_model(model_name: str = "yolo11n-pose.pt"):
-    """Lazy loader for YOLO pose estimation model."""
-    global _YOLO_MODEL
-    if _YOLO_MODEL is None:
+    """Lazy loader for YOLO pose estimation models, cached per model name."""
+    if model_name not in _POSE_MODELS:
         from ultralytics import YOLO
 
-        _YOLO_MODEL = YOLO(model_name)
-    return _YOLO_MODEL
+        _POSE_MODELS[model_name] = YOLO(model_name)
+    return _POSE_MODELS[model_name]
 
 
 # ---------------------------------------------------------------------------
