@@ -1,5 +1,5 @@
 from src.dataset import discover_clips
-from src.manifest import MANIFEST_COLUMNS, ClipRecord
+from src.manifest import MANIFEST_COLUMNS, ClipRecord, ManifestError
 
 
 def test_discover_clips_uses_manifest(tmp_path):
@@ -69,3 +69,29 @@ def test_discover_clips_multi_excludes_epee_by_default(monkeypatch):
     loaded.clear()
     discover_clips(weapon="multi", exclude_weapons=[], validate=False)
     assert loaded == ["foil", "sabre", "epee"]
+
+
+def test_discover_clips_default_dir_follows_weapon(tmp_path, monkeypatch):
+    loaded = []
+
+    def fake_load(directory, weapon):
+        loaded.append((str(directory).replace("\\", "/"), weapon))
+        return [ClipRecord(f"data/clips/{weapon}/L_{weapon}_a_1.mp4", "L", weapon)]
+
+    monkeypatch.setattr(dataset_module, "load_weapon_records", fake_load)
+    monkeypatch.setattr(os.path, "isdir", lambda p: True)
+    discover_clips(clips_dir=None, weapon="sabre", validate=False)
+    assert loaded[0][0].endswith("data/clips/sabre")
+
+
+def test_discover_clips_rejects_weapon_mismatch(tmp_path):
+    (tmp_path / "L_foil_a_b_1.mp4").write_bytes(b"")
+    with pytest.raises(ManifestError, match="sabre"):
+        discover_clips(clips_dir=str(tmp_path), weapon="sabre", validate=False)
+
+
+def test_default_config_clips_dir_is_null():
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load("configs/default.yaml")
+    assert cfg.data.clips_dir is None

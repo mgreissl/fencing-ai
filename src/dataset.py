@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.kinematics import load_or_compute_kinematics, select_kinematic_frames
-from src.manifest import ClipRecord, load_weapon_records, merge_records
+from src.manifest import ClipRecord, ManifestError, load_weapon_records, merge_records
 from src.splits import stratified_subset
 
 log = logging.getLogger(__name__)
@@ -330,6 +330,14 @@ def discover_clips(
         w_count = 0
         for directory in target_dirs:
             recs = load_weapon_records(directory, w)
+            if len(weapons_to_load) == 1:
+                wrong = sorted({r.weapon for r in recs if r.weapon != w})
+                if wrong:
+                    raise ManifestError(
+                        f"requested weapon '{w}' but {directory} contains "
+                        f"{wrong} clips; set data.clips_dir to a matching "
+                        f"directory or leave it null"
+                    )
             w_count += len(recs)
             per_dir.append(recs)
 
