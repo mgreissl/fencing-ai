@@ -128,22 +128,27 @@ class Window:
 
 
 def compute_window(onset_frame, source_fps, pre_s=PRE_S, post_s=POST_S,
-                   total_frames=None):
+                   total_frames=None, clip_fps=None):
     """Window of ``pre_s`` before to ``post_s`` after the light onset.
 
-    Frames are taken at the native source fps. The onset frame is clip frame
-    ``round(pre_s * fps)``. Returns None if the window leaves the video.
+    By default frames are taken at the native source fps. With ``clip_fps``
+    below the source fps, source frames are subsampled; the onset frame is
+    always kept exactly. The onset is clip frame ``round(pre_s * clip_fps)``.
+    Returns None if the window leaves the video.
     """
-    n_pre = seconds_to_frames(pre_s, source_fps)
-    n_post = seconds_to_frames(post_s, source_fps)
-    start = onset_frame - n_pre
-    stop = onset_frame + n_post  # exclusive
-    if start < 0 or (total_frames is not None and stop > total_frames):
+    out_fps = source_fps if clip_fps is None else float(clip_fps)
+    if out_fps > source_fps * 1.001:
+        raise ValueError(f"clip_fps {out_fps} exceeds source fps {source_fps}")
+    n_pre = seconds_to_frames(pre_s, out_fps)
+    n_post = seconds_to_frames(post_s, out_fps)
+    offsets = np.arange(-n_pre, n_post)  # clip frames relative to the onset
+    src = onset_frame + np.rint(offsets * (source_fps / out_fps)).astype(int)
+    if src[0] < 0 or (total_frames is not None and src[-1] >= total_frames):
         return None
     return Window(
-        src_indices=tuple(range(start, stop)),
+        src_indices=tuple(int(i) for i in src),
         light_frame_in_clip=n_pre,
-        clip_fps=source_fps,
+        clip_fps=out_fps,
         source_fps=source_fps,
     )
 
@@ -195,6 +200,7 @@ class PipelineConfig:
 
     pre_s: float = PRE_S
     post_s: float = POST_S
+    clip_fps: float = None        # None = native source fps
     intro_s: float = INTRO_S
     min_dark_s: float = 0.5       # lights must be off this long before an onset
     hit_window_s: float = 0.5     # lights are merged over this long after onset
@@ -321,7 +327,8 @@ def analyse_timeline(timeline, weapon, cfg=None):
         if label is None:
             continue
         window = compute_window(onset, fps, cfg.pre_s, cfg.post_s,
-                                total_frames=timeline.n_frames)
+                                total_frames=timeline.n_frames,
+                                clip_fps=cfg.clip_fps)
         if window is None:
             continue
         candidates.append(Candidate(onset, hit_type, label, before[0], after[0], window))
@@ -486,11 +493,14 @@ def add_cli_args(parser):
                         help="seconds kept before the light onset")
     parser.add_argument("--post-s", type=float, default=POST_S,
                         help="seconds kept after the light onset")
+    parser.add_argument("--clip-fps", type=float, default=None,
+                        help="fps of saved clips (default: native source fps)")
 
 
 def config_from_args(args):
     """Build a PipelineConfig from parsed command line options."""
-    return PipelineConfig(pre_s=args.pre_s, post_s=args.post_s)
+    return PipelineConfig(pre_s=args.pre_s, post_s=args.post_s,
+                          clip_fps=args.clip_fps)
 
 
 if __name__ == "__main__":
