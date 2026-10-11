@@ -162,6 +162,23 @@ Defaults live in `configs/default.yaml`; every key can be overridden on the comm
 
 Overlay geometry (light boxes, score digit crops, thresholds) is configured per broadcast template in `configs/overlay/`.
 
+### Statistical Evaluation
+
+A single test accuracy on a few hundred clips from a handful of matches is not enough to rank models (#17). Evaluation writes `predictions_<split>.csv`; `bootstrap` resamples matches (not clips) from them:
+
+```bash
+# Match-level bootstrap CIs for accuracy and macro-F1
+python -m src bootstrap checkpoints/predictions_test.csv
+
+# Pool several CV folds
+python -m src bootstrap fold0/predictions_test.csv fold1/predictions_test.csv
+
+# Paired comparison of two models on the same clips (McNemar test + bootstrap difference)
+python -m src bootstrap a/predictions_test.csv --compare b/predictions_test.csv
+```
+
+Options: `--n-boot` (default 2000), `--seed`.
+
 ---
 
 ## 6. Data Source and Usage Restrictions
