@@ -19,3 +19,5 @@ yt-dlp==2026.8.19
 decord==0.6.0
 ultralytics==8.4.175
 scipy==1.18.1
+pyyaml==6.0.3
+matplotlib==3.11.2
