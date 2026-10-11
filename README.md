@@ -36,8 +36,9 @@ This project expands upon work by Sholto Douglas in [SholtoD/fencing-AI](https:/
 | Model Architecture | Adaptation Method | Test Accuracy | Peak Val Accuracy |
 | :--- | :--- | :---: | :---: |
 | **Fencing AI (2017)** | InceptionV3 + Rainbow Flow + LSTM | ~60.0% *(w/ leakage)* | — |
-| **VideoMAE** | Frozen Backbone + MLP Head | 57.66% | 60.57% |
-| **VideoMAE + LoRA** | Bilateral Spatial Pooling + LoRA (8–11) | **63.31%** | **72.76%** |
+| **VideoMAE** | Frozen Backbone + MLP Head | 58.85% | 60.50% |
+| **VideoMAE + LoRA (Foil)** | Bilateral Spatial Pooling + LoRA (8–11) | **63.79%** | **72.76%** |
+| **VideoMAE + LoRA (Multi-Weapon)** | Bilateral Pooling + LoRA + Weapon Embed | 51.62% | 58.31% |
 
 ---
 

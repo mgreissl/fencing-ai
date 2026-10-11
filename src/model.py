@@ -57,6 +57,35 @@ class FencingClassificationHead(nn.Module):
         return self.head(x)
 
 
+class KinematicEncoder(nn.Module):
+    """
+    Temporal 1D-CNN + LayerNorm encoder for fencer sword-arm kinematics (B, T, D_kin).
+    Captures temporal acceleration spikes, velocity differences, and arm extensions.
+    """
+
+    def __init__(self, in_features: int = 16, hidden_dim: int = 64, out_dim: int = 128):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(in_features, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, out_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(out_dim),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.proj = nn.Sequential(
+            nn.Linear(out_dim, out_dim),
+            nn.LayerNorm(out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D_kin) -> transpose to (B, D_kin, T) for Conv1D
+        x = x.transpose(1, 2)
+        feat = self.conv(x).squeeze(-1)  # (B, out_dim)
+        return self.proj(feat)
+
+
 class FencingVideoMAE(nn.Module):
     """
     VideoMAE backbone + custom classification head for fencing referee AI.
@@ -77,6 +106,10 @@ class FencingVideoMAE(nn.Module):
         hidden_dim: int = 256,
         num_classes: int = 3,
         dropout: float = 0.3,
+        use_kinematics: bool = False,
+        kinematics_in_features: int = 16,
+        kinematics_hidden_dim: int = 64,
+        kinematics_out_dim: int = 128,
     ):
         super().__init__()
 
@@ -88,8 +121,13 @@ class FencingVideoMAE(nn.Module):
         # Load the pre-trained model
         pretrained = VideoMAEForVideoClassification.from_pretrained(backbone_name)
 
-        # Extract base VideoMAE encoder
+        # Extract base VideoMAE encoder and fc_norm
         base_videomae = pretrained.videomae
+        self.fc_norm = (
+            pretrained.fc_norm
+            if hasattr(pretrained, "fc_norm")
+            else nn.LayerNorm(base_videomae.config.hidden_size)
+        )
 
         # Apply LoRA if requested
         if use_lora:
@@ -115,20 +153,28 @@ class FencingVideoMAE(nn.Module):
             else:
                 log.info("Full model is trainable (backbone NOT frozen)")
 
-        self.fc_norm = (
-            pretrained.fc_norm
-            if hasattr(pretrained, "fc_norm")
-            else nn.LayerNorm(base_videomae.config.hidden_size)
-        )
-
         # Get the hidden dimension from the backbone config
         backbone_hidden_size = base_videomae.config.hidden_size
-        # Bilateral pooling feature dimension: global pool (768) + spatial difference (768) = 1536
-        self.classifier_in_features = 2 * backbone_hidden_size
-        log.info(f"Backbone hidden size: {backbone_hidden_size} (Bilateral pooled features: {self.classifier_in_features})")
+        self.video_feature_dim = 2 * backbone_hidden_size
+
+        # Kinematic stream setup
+        self.use_kinematics = use_kinematics
+        if self.use_kinematics:
+            self.kinematics_dim = kinematics_out_dim
+            self.kinematic_encoder = KinematicEncoder(
+                in_features=kinematics_in_features,
+                hidden_dim=kinematics_hidden_dim,
+                out_dim=kinematics_out_dim,
+            )
+            self.classifier_in_features = self.video_feature_dim + self.kinematics_dim
+            log.info(f"Kinematic dual-stream encoder enabled (in={kinematics_in_features}, out={kinematics_out_dim})")
+        else:
+            self.classifier_in_features = self.video_feature_dim
+
+        log.info(f"Backbone hidden size: {backbone_hidden_size} (Total classifier in_features: {self.classifier_in_features})")
 
         # Learned weapon conditioning embedding (0=Foil, 1=Sabre, 2=Epee)
-        self.weapon_embed = nn.Embedding(3, self.classifier_in_features)
+        self.weapon_embed = nn.Embedding(3, self.video_feature_dim)
 
         # Custom classification head
         self.classifier = FencingClassificationHead(
@@ -154,7 +200,10 @@ class FencingVideoMAE(nn.Module):
             param.requires_grad = False
 
     def forward(
-        self, pixel_values: torch.Tensor, weapon_id: Optional[torch.Tensor] = None
+        self,
+        pixel_values: torch.Tensor,
+        weapon_id: Optional[torch.Tensor] = None,
+        kinematics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -162,29 +211,25 @@ class FencingVideoMAE(nn.Module):
         Args:
             pixel_values: Tensor of shape (B, T, C, H, W) — batch of video clips.
             weapon_id: Optional tensor of shape (B,) with weapon integers (0=Foil, 1=Sabre, 2=Epee).
+            kinematics: Optional tensor of shape (B, T, D_kin) with kinematic time-series.
 
         Returns:
             Logits tensor of shape (B, num_classes).
         """
-        # VideoMAE expects (B, T, C, H, W) — this is our input format
+        # VideoMAE expects (B, T, C, H, W)
         outputs = self.backbone(pixel_values=pixel_values)
 
         # Sequence output: (B, num_patches, hidden_size)
         sequence_output = outputs.last_hidden_state
-
-        # Normalize patch tokens with fc_norm
         sequence_output = self.fc_norm(sequence_output)
 
         B, N, C = sequence_output.shape
         if N == 1568:
-            # 16 frames / 2 = 8 temporal slices; 224/16 = 14 height; 224/16 = 14 width
             grid = sequence_output.view(B, 8, 14, 14, C)
-            # Global pool: average across all space and time
             z_global = grid.mean(dim=(1, 2, 3))
-            # Left half of screen (W: 0..6) vs Right half of screen (W: 7..13)
             z_left = grid[:, :, :, :7, :].mean(dim=(1, 2, 3))
             z_right = grid[:, :, :, 7:, :].mean(dim=(1, 2, 3))
-            z_diff = z_left - z_right  # Anti-symmetric under horizontal flip
+            z_diff = z_left - z_right
             pooled = torch.cat([z_global, z_diff], dim=-1)
         else:
             z_global = sequence_output.mean(dim=1)
@@ -193,6 +238,16 @@ class FencingVideoMAE(nn.Module):
         # Add learned weapon conditioning if provided
         if weapon_id is not None:
             pooled = pooled + self.weapon_embed(weapon_id)
+
+        # Fuse kinematic features if enabled
+        if self.use_kinematics:
+            if kinematics is not None:
+                kin_feat = self.kinematic_encoder(kinematics)
+            else:
+                kin_feat = torch.zeros(
+                    pooled.size(0), self.kinematics_dim, device=pooled.device, dtype=pooled.dtype
+                )
+            pooled = torch.cat([pooled, kin_feat], dim=-1)
 
         # Classification logits
         logits = self.classifier(pooled)
@@ -214,6 +269,11 @@ def build_model(cfg) -> FencingVideoMAE:
     lora_alpha = getattr(cfg.model.lora, "alpha", 16) if hasattr(cfg.model, "lora") else 16
     lora_layers = list(getattr(cfg.model.lora, "layers", [8, 9, 10, 11])) if hasattr(cfg.model, "lora") else [8, 9, 10, 11]
 
+    use_kinematics = getattr(cfg.model, "use_kinematics", False)
+    kin_in = getattr(cfg.model.kinematics, "feature_dim", 16) if hasattr(cfg.model, "kinematics") else 16
+    kin_hidden = getattr(cfg.model.kinematics, "hidden_dim", 64) if hasattr(cfg.model, "kinematics") else 64
+    kin_out = getattr(cfg.model.kinematics, "out_dim", 128) if hasattr(cfg.model, "kinematics") else 128
+
     model = FencingVideoMAE(
         backbone_name=cfg.model.backbone,
         freeze_backbone=cfg.model.freeze_backbone,
@@ -224,5 +284,10 @@ def build_model(cfg) -> FencingVideoMAE:
         hidden_dim=cfg.model.head.hidden_dim,
         num_classes=cfg.model.head.num_classes,
         dropout=cfg.model.head.dropout,
+        use_kinematics=use_kinematics,
+        kinematics_in_features=kin_in,
+        kinematics_hidden_dim=kin_hidden,
+        kinematics_out_dim=kin_out,
     )
     return model
+

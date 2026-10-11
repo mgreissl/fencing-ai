@@ -48,10 +48,11 @@ def evaluate(
         pixel_values = batch["pixel_values"].to(device)
         labels = torch.as_tensor(batch["label"], dtype=torch.long).to(device)
         weapon_ids = torch.as_tensor(batch["weapon_id"], dtype=torch.long).to(device) if "weapon_id" in batch else None
+        kinematics = batch["kinematics"].to(device) if "kinematics" in batch else None
 
         amp_device = "cuda" if device.type == "cuda" else ("mps" if device.type == "mps" else "cpu")
         with torch.amp.autocast(device_type=amp_device, enabled=device.type in ["cuda", "mps"]):
-            logits = model(pixel_values, weapon_id=weapon_ids)
+            logits = model(pixel_values, weapon_id=weapon_ids, kinematics=kinematics)
             loss = criterion(logits, labels)
 
         probs = torch.softmax(logits, dim=-1)
@@ -68,10 +69,12 @@ def evaluate(
             all_weapons.extend([0] * labels.size(0))
 
     # Compute metrics
+    class_indices = list(range(len(class_names)))
     accuracy = accuracy_score(all_labels, all_preds)
     report = classification_report(
         all_labels,
         all_preds,
+        labels=class_indices,
         target_names=class_names,
         output_dict=True,
         zero_division=0,
@@ -79,10 +82,11 @@ def evaluate(
     report_str = classification_report(
         all_labels,
         all_preds,
+        labels=class_indices,
         target_names=class_names,
         zero_division=0,
     )
-    cm = sk_confusion_matrix(all_labels, all_preds)
+    cm = sk_confusion_matrix(all_labels, all_preds, labels=class_indices)
 
     results = {
         "accuracy": accuracy,
@@ -263,11 +267,13 @@ def main(cfg: DictConfig):
 
     eval_transform = build_eval_transforms(cfg)
     sampling_mode = getattr(cfg.data, "sampling_mode", "end_weighted")
+    use_kinematics = getattr(cfg.model, "use_kinematics", False)
     test_dataset = FencingVideoDataset(
         samples=test_samples,
         num_frames=cfg.data.num_frames,
         transform=eval_transform,
         sampling_mode=sampling_mode,
+        use_kinematics=use_kinematics,
     )
     test_loader = DataLoader(
         test_dataset,

@@ -66,10 +66,9 @@ class TrainVideoTransform:
         self.flip_prob = flip_prob
         self.grayscale_prob = grayscale_prob
 
-        # Build per-frame spatial transforms (applied with same random state)
-        self.resize_crop = T.RandomResizedCrop(
+        # Direct resize preserves full widescreen piste and both fencers
+        self.resize = T.Resize(
             size=(frame_size, frame_size),
-            scale=crop_scale,
             antialias=True,
         )
         self.color_jitter_transform = (
@@ -85,35 +84,27 @@ class TrainVideoTransform:
         self.normalize = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
 
     def __call__(
-        self, frames: torch.Tensor, label: int
-    ) -> tuple[torch.Tensor, int]:
+        self,
+        frames: torch.Tensor,
+        label: int,
+        kinematics: Optional[torch.Tensor] = None,
+    ):
         """
         Apply augmentations to a clip.
 
         Args:
             frames: Tensor of shape (T, C, H, W) with values in [0, 1].
             label: Integer class label.
+            kinematics: Optional kinematic tensor (T, 16).
 
         Returns:
-            Tuple of (augmented_frames, possibly_swapped_label).
+            Tuple of (augmented_frames, possibly_swapped_label) or
+            (augmented_frames, possibly_swapped_label, possibly_flipped_kinematics).
         """
-        T_len = frames.shape[0]
+        # --- Direct Resize (preserves both fencers and entire piste) ---
+        frames = torch.stack([self.resize(f) for f in frames])
 
-        # --- Random Resized Crop (same crop for all frames) ---
-        # Get crop parameters once, apply to every frame
-        i, j, h, w = self.resize_crop.get_params(
-            frames[0], scale=self.crop_scale, ratio=(0.75, 1.333)
-        )
-        frames = torch.stack(
-            [
-                T.functional.resized_crop(
-                    f, i, j, h, w, (self.frame_size, self.frame_size), antialias=True
-                )
-                for f in frames
-            ]
-        )
-
-        # --- Random Horizontal Flip (with label swap) ---
+        # --- Random Horizontal Flip (with label & kinematics swap) ---
         if random.random() < self.flip_prob:
             frames = torch.flip(frames, dims=[-1])  # Flip width dimension
             if label == LABEL_LEFT:
@@ -121,6 +112,11 @@ class TrainVideoTransform:
             elif label == LABEL_RIGHT:
                 label = LABEL_LEFT
             # LABEL_TIE stays the same
+
+            if kinematics is not None:
+                from src.kinematics import flip_kinematic_features
+
+                kinematics = flip_kinematic_features(kinematics)
 
         # --- Color Jitter (same params for all frames) ---
         if self.color_jitter_transform is not None:
@@ -141,13 +137,15 @@ class TrainVideoTransform:
         # --- Normalize ---
         frames = torch.stack([self.normalize(f) for f in frames])
 
+        if kinematics is not None:
+            return frames, label, kinematics
         return frames, label
 
 
 class EvalVideoTransform:
     """
-    Deterministic evaluation transforms: resize + center crop + normalize.
-    No random augmentation — ensures reproducible evaluation metrics.
+    Deterministic evaluation transforms: direct resize + normalize.
+    Preserves full widescreen piste geometry without cropping out fencers.
     """
 
     def __init__(self, frame_size: int = 224):
@@ -155,26 +153,31 @@ class EvalVideoTransform:
         self.transform = T.Compose(
             [
                 T.Resize(
-                    size=int(frame_size * 1.143),  # ~256 for 224
+                    size=(frame_size, frame_size),
                     antialias=True,
                 ),
-                T.CenterCrop(size=(frame_size, frame_size)),
                 T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ]
         )
 
     def __call__(
-        self, frames: torch.Tensor, label: int
-    ) -> tuple[torch.Tensor, int]:
+        self,
+        frames: torch.Tensor,
+        label: int,
+        kinematics: Optional[torch.Tensor] = None,
+    ):
         """
         Apply deterministic transforms to a clip.
 
         Args:
             frames: Tensor of shape (T, C, H, W) with values in [0, 1].
             label: Integer class label (unchanged).
+            kinematics: Optional kinematic tensor (T, 16).
 
         Returns:
-            Tuple of (transformed_frames, label).
+            Tuple of (transformed_frames, label) or (transformed_frames, label, kinematics).
         """
         frames = torch.stack([self.transform(f) for f in frames])
+        if kinematics is not None:
+            return frames, label, kinematics
         return frames, label

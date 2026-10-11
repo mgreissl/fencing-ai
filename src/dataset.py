@@ -328,6 +328,8 @@ class FencingVideoDataset(Dataset):
         sampling_mode: str = "end_weighted",
         temporal_jitter: bool = False,
         max_shift: int = 1,
+        use_kinematics: bool = False,
+        kinematics_cache_dir: str = "data/kinematics",
     ):
         self.samples = samples
         self.num_frames = num_frames
@@ -335,6 +337,8 @@ class FencingVideoDataset(Dataset):
         self.sampling_mode = sampling_mode
         self.temporal_jitter = temporal_jitter
         self.max_shift = max_shift
+        self.use_kinematics = use_kinematics
+        self.kinematics_cache_dir = kinematics_cache_dir
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -363,13 +367,41 @@ class FencingVideoDataset(Dataset):
                 self.num_frames, 3, 224, 224, dtype=torch.float32
             )
 
-        # Apply transforms (including dynamic horizontal flip & label swap)
-        if self.transform is not None:
-            frames, label = self.transform(frames, label)
+        # Kinematic feature extraction & caching
+        kinematics = None
+        if self.use_kinematics:
+            os.makedirs(self.kinematics_cache_dir, exist_ok=True)
+            fname = os.path.splitext(os.path.basename(path))[0]
+            cache_file = os.path.join(self.kinematics_cache_dir, f"{fname}.npy")
+            if os.path.exists(cache_file):
+                try:
+                    kin_feats = np.load(cache_file)
+                except Exception:
+                    from src.kinematics import extract_kinematic_features
 
-        return {
+                    kin_feats = extract_kinematic_features(frames)
+                    np.save(cache_file, kin_feats)
+            else:
+                from src.kinematics import extract_kinematic_features
+
+                kin_feats = extract_kinematic_features(frames)
+                np.save(cache_file, kin_feats)
+
+            kinematics = torch.from_numpy(kin_feats).float()
+
+        # Apply transforms (including dynamic horizontal flip & label/kinematics swap)
+        if self.transform is not None:
+            if kinematics is not None:
+                frames, label, kinematics = self.transform(frames, label, kinematics)
+            else:
+                frames, label = self.transform(frames, label)
+
+        result = {
             "pixel_values": frames,
             "label": label,
             "weapon_id": weapon_id,
             "path": path,
         }
+        if kinematics is not None:
+            result["kinematics"] = kinematics
+        return result

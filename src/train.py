@@ -116,13 +116,14 @@ def _train_one_epoch(
         pixel_values = batch["pixel_values"].to(device)
         labels = torch.as_tensor(batch["label"], dtype=torch.long).to(device)
         weapon_ids = torch.as_tensor(batch["weapon_id"], dtype=torch.long).to(device) if "weapon_id" in batch else None
+        kinematics = batch["kinematics"].to(device) if "kinematics" in batch else None
 
         optimizer.zero_grad()
 
         # Mixed precision forward (CUDA and Apple Silicon MPS)
         amp_device = "cuda" if device.type == "cuda" else ("mps" if device.type == "mps" else "cpu")
         with torch.amp.autocast(device_type=amp_device, enabled=use_amp and device.type in ["cuda", "mps"]):
-            logits = model(pixel_values, weapon_id=weapon_ids)
+            logits = model(pixel_values, weapon_id=weapon_ids, kinematics=kinematics)
             loss = criterion(logits, labels)
 
         # Backward
@@ -199,10 +200,11 @@ def _validate(
         pixel_values = batch["pixel_values"].to(device)
         labels = torch.as_tensor(batch["label"], dtype=torch.long).to(device)
         weapon_ids = torch.as_tensor(batch["weapon_id"], dtype=torch.long).to(device) if "weapon_id" in batch else None
+        kinematics = batch["kinematics"].to(device) if "kinematics" in batch else None
 
         amp_device = "cuda" if device.type == "cuda" else ("mps" if device.type == "mps" else "cpu")
         with torch.amp.autocast(device_type=amp_device, enabled=device.type in ["cuda", "mps"]):
-            logits = model(pixel_values, weapon_id=weapon_ids)
+            logits = model(pixel_values, weapon_id=weapon_ids, kinematics=kinematics)
             loss = criterion(logits, labels)
 
         total_loss += loss.item() * labels.size(0)
@@ -419,6 +421,8 @@ def main(cfg: DictConfig):
     sampling_mode = getattr(cfg.data, "sampling_mode", "end_weighted")
     log.info(f"Using temporal frame sampling mode: {sampling_mode}")
 
+    use_kinematics = getattr(cfg.model, "use_kinematics", False)
+
     train_dataset = FencingVideoDataset(
         samples=train_samples,
         num_frames=cfg.data.num_frames,
@@ -426,12 +430,14 @@ def main(cfg: DictConfig):
         sampling_mode=sampling_mode,
         temporal_jitter=cfg.augmentation.train.temporal_jitter.enabled,
         max_shift=cfg.augmentation.train.temporal_jitter.max_shift,
+        use_kinematics=use_kinematics,
     )
     val_dataset = FencingVideoDataset(
         samples=val_samples,
         num_frames=cfg.data.num_frames,
         transform=eval_transform,
         sampling_mode=sampling_mode,
+        use_kinematics=use_kinematics,
     )
 
     train_loader = DataLoader(

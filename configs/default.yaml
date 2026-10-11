@@ -55,6 +55,12 @@ model:
       - 10
       - 11
 
+  # Kinematics & Sword-Arm Velocity Stream
+  use_kinematics: true
+  kinematics:
+    feature_dim: 16
+    hidden_dim: 128
+
   # Classification head config
   head:
     hidden_dim: 256
@@ -71,7 +77,7 @@ model:
 training:
   batch_size: 4
   epochs: 20
-  lr: 5.0e-4
+  lr: 1.5e-4
   weight_decay: 1.0e-4
 
   # Learning rate scheduler
