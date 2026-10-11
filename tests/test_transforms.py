@@ -101,9 +101,11 @@ def _overlay_cfg(enabled=True):
 
 def test_builders_read_overlay_config():
     cfg = _overlay_cfg()
-    assert cfg.data.overlay_mask.y_min_frac == 0.82
-    assert build_train_transforms(cfg).overlay_mask_y_min_frac == 0.82
-    assert build_eval_transforms(cfg).overlay_mask_y_min_frac == 0.82
+    # null in the config means: derive the band from the overlay geometry
+    assert cfg.data.overlay_mask.y_min_frac is None
+    derived = pytest.approx(295 / 360)
+    assert build_train_transforms(cfg).overlay_mask_y_min_frac == derived
+    assert build_eval_transforms(cfg).overlay_mask_y_min_frac == derived
     off = _overlay_cfg(enabled=False)
     assert build_train_transforms(off).overlay_mask_y_min_frac is None
     assert build_eval_transforms(off).overlay_mask_y_min_frac is None
