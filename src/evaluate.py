@@ -437,6 +437,7 @@ def main(cfg: DictConfig):
         train_labels=[r.label_id for r in train_samples],
         train_hit_types=[r.hit_type for r in train_samples],
         ece_bins=cfg.eval.ece_bins,
+        train_weapons=[r.weapon for r in train_samples],
     )
     results["report_extra"] = report
     _log_report(report)

@@ -6,7 +6,7 @@ Labels are integer class ids: 0=Left, 1=Tie, 2=Right.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -162,15 +162,51 @@ def on_on_majority(
     return majority_class(labels[mask])
 
 
+def on_on_majority_by_weapon(
+    train_labels: Sequence[int],
+    train_hit_types: Sequence[str],
+    train_weapons: Sequence[str],
+) -> dict[str, int]:
+    """On-On majority label per weapon of the training clips.
+
+    Epee On-On is always a double hit (Tie) by rule. A weapon without On-On
+    training clips falls back to the pooled On-On majority.
+    """
+    labels = np.asarray(train_labels, dtype=np.int64)
+    hits = np.asarray(train_hit_types, dtype=object)
+    weapons = np.asarray(train_weapons, dtype=object)
+    pooled = on_on_majority(labels, hits)
+    out = {}
+    for weapon in sorted({str(w) for w in weapons}):
+        mask = (weapons == weapon) & (hits == "On-On")
+        out[weapon] = majority_class(labels[mask]) if mask.any() else pooled
+    out["epee"] = TIE
+    return out
+
+
 def light_only_predict(
-    hit_types: Sequence[str], on_on_label: int, fallback_label: int
+    hit_types: Sequence[str],
+    on_on_label: int | Mapping[str, int],
+    fallback_label: int,
+    weapons: Optional[Sequence[str]] = None,
 ) -> NDArray[np.int64]:
     """Rule using only the lights: On-No/On-Off -> L, No-On/Off-On -> R,
-    On-On -> `on_on_label`, unknown hit_type -> `fallback_label`."""
+    On-On -> `on_on_label`, unknown hit_type -> `fallback_label`.
+
+    With ``weapons``, epee On-On is Tie (a double hit, no right of way) and
+    ``on_on_label`` may be a ``{weapon: label}`` mapping (weapons missing from
+    it use ``fallback_label``).
+    """
     preds = []
-    for hit in hit_types:
+    for i, hit in enumerate(hit_types):
+        weapon = None if weapons is None else str(weapons[i])
         if hit == "On-On":
-            preds.append(on_on_label)
+            if weapon == "epee":
+                preds.append(TIE)
+            elif isinstance(on_on_label, Mapping):
+                preds.append(on_on_label.get(weapon, fallback_label))
+            else:
+                preds.append(on_on_label)
         else:
             preds.append(LIGHT_RULE.get(hit, fallback_label))
     return np.asarray(preds, dtype=np.int64)
@@ -257,13 +293,16 @@ def evaluation_report(
     train_labels: Sequence[int],
     train_hit_types: Sequence[str],
     ece_bins: int = 10,
+    train_weapons: Optional[Sequence[str]] = None,
 ) -> dict:
     """Overall, per-hit-type and per-weapon metrics plus rule baselines.
 
     Baselines (scored on the same clips):
     - ``majority``: always the train-set majority class.
-    - ``light_only``: the light rule (On-On -> train On-On majority; clips
-      with unknown hit_type -> train majority).
+    - ``light_only``: the light rule per weapon (On-On -> train On-On
+      majority of that weapon, epee On-On -> Tie; clips with unknown hit_type
+      -> train majority). Without ``train_weapons`` the On-On majority is
+      pooled across weapons.
     ``on_on`` reports the model's accuracy on On-On clips separately (None
     if the evaluation set has none).
     """
@@ -274,10 +313,17 @@ def evaluation_report(
     train_majority = majority_class(train_labels)
 
     majority_pred = np.full(len(y_true), train_majority, dtype=np.int64)
+    if train_weapons is None:
+        on_on_label = on_on_majority(train_labels, train_hit_types)
+    else:
+        on_on_label = on_on_majority_by_weapon(
+            train_labels, train_hit_types, train_weapons
+        )
     light_pred = light_only_predict(
         np.where(hits == "unknown", "", hits),
-        on_on_label=on_on_majority(train_labels, train_hit_types),
+        on_on_label=on_on_label,
         fallback_label=train_majority,
+        weapons=weapons,
     )
 
     per_hit = group_metrics(y_true, y_pred, hits)

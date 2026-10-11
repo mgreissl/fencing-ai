@@ -188,3 +188,59 @@ def test_prediction_roundtrip(tmp_path):
     assert got["label"].tolist() == [0, 2] and got["pred"].tolist() == [1, 2]
     assert got["probs"].shape == (2, 3) and got["probs"][0, 1] == 0.7
     assert got["match_id"].tolist() == ["m1", "m2"]
+
+
+def test_light_only_epee_on_on_is_tie_regardless_of_majority():
+    hits = ["On-On", "On-No", "No-On", "On-On"]
+    weapons = ["epee", "epee", "epee", "foil"]
+    preds = light_only_predict(
+        hits, on_on_label=2, fallback_label=0, weapons=weapons
+    )
+    assert preds.tolist() == [1, 0, 2, 2]
+
+
+def test_light_only_on_on_label_per_weapon_mapping():
+    hits = ["On-On", "On-On", "On-On"]
+    weapons = ["foil", "sabre", "epee"]
+    preds = light_only_predict(
+        hits, on_on_label={"foil": 0, "sabre": 2}, fallback_label=1, weapons=weapons
+    )
+    assert preds.tolist() == [0, 2, 1]
+
+
+def test_on_on_majority_per_weapon():
+    from src.metrics import on_on_majority_by_weapon
+
+    labels = [0, 0, 2, 2, 2, 1]
+    hits = ["On-On"] * 6
+    weapons = ["foil", "foil", "sabre", "sabre", "sabre", "epee"]
+    maj = on_on_majority_by_weapon(labels, hits, weapons)
+    assert maj["foil"] == 0 and maj["sabre"] == 2 and maj["epee"] == 1
+
+
+def test_on_on_majority_by_weapon_falls_back_to_pooled():
+    from src.metrics import on_on_majority_by_weapon
+
+    labels = [0, 0, 2]
+    hits = ["On-On", "On-On", "On-No"]
+    weapons = ["foil", "foil", "sabre"]  # sabre has no On-On
+    maj = on_on_majority_by_weapon(labels, hits, weapons)
+    assert maj["foil"] == 0
+    assert maj["sabre"] == 0  # pooled On-On majority
+
+
+def test_evaluation_report_light_only_is_weapon_aware():
+    from src.metrics import evaluation_report
+
+    # train: foil On-On mostly L, sabre On-On mostly R
+    train_labels = [0, 0, 2, 2, 2]
+    train_hits = ["On-On"] * 5
+    train_weapons = ["foil", "foil", "sabre", "sabre", "sabre"]
+    y_true = [0, 2, 1]
+    hits = ["On-On", "On-On", "On-On"]
+    weapons = ["foil", "sabre", "epee"]
+    rep = evaluation_report(
+        y_true, y_true, np.eye(3)[y_true], hits, weapons,
+        train_labels, train_hits, train_weapons=train_weapons,
+    )
+    assert rep["baselines"]["light_only"]["accuracy"] == pytest.approx(1.0)
