@@ -788,6 +788,26 @@ def mark_processed(weapon, url, state_dir=PIPELINE_STATE_DIR):
         fh.write(url + "\n")
 
 
+FAILED_COLUMNS = ["url", "weapon", "reason", "timestamp"]
+
+
+def failed_path(weapon):
+    """Per-weapon failure log: state/failed_{weapon}.csv."""
+    return os.path.join(PIPELINE_STATE_DIR, f"failed_{weapon}.csv")
+
+
+def record_failure(weapon, url, reason):
+    """Append a failed match to state/failed_{weapon}.csv so it can be retried."""
+    path = failed_path(weapon)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    is_new = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        if is_new:
+            writer.writerow(FAILED_COLUMNS)
+        writer.writerow([url, weapon, reason, time.strftime("%Y-%m-%dT%H:%M:%S")])
+
+
 def process_video_file(vid_path, output_dir, weapon="foil", cfg=None,
                        rejections_path=None, reason_counts=None,
                        min_video_s=MIN_VIDEO_S, match_id=None, source_url="",
@@ -918,12 +938,14 @@ def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
             match_id = parse_match_id(url)
         except ValueError as e:
             print(f"Skipping: {e}")
+            record_failure(weapon, url, f"ValueError: {e}")
             continue
 
         # Download in 360p via Firefox cookies + Deno JS challenge solver
         fpath, title = download_match(url, match_id, precut_dir)
         if fpath is None:
             print(f"Failed to download {url}, skipping.")
+            record_failure(weapon, url, "download failed")
             continue
 
         try:
@@ -936,12 +958,14 @@ def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
             total_new_clips += count
         except Exception as e:
             print(f"Error processing {match_id}: {e}")
+            record_failure(weapon, url, f"{type(e).__name__}: {e}")
+            continue
         finally:
             for leftover in (fpath, os.path.join(precut_dir, f"{match_id}.info.json")):
                 if os.path.exists(leftover):
                     os.remove(leftover)
 
-        # Log URL as processed
+        # Log URL as processed only after a successful run
         mark_processed(weapon, url)
         processed_urls.add(url)
 
