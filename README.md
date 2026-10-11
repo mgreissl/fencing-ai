@@ -27,7 +27,7 @@ This project expands upon work by Sholto Douglas in [SholtoD/fencing-AI](https:/
 - **Bilateral Spatial-Difference Pooling**: Resolves left-right orientation symmetry collapse by extracting global scene context combined with lateral difference features:
   $$\mathbf{z} = \left[ \mathbf{z}_{\text{global}}, \; \mathbf{z}_{\text{left}} - \mathbf{z}_{\text{right}} \right] \in \mathbb{R}^{1536}$$
   This achieves approximate flip-relatedness through left-right difference features. Exact equivariance requires test-time averaging: average $p(L|x)$ with $p(R|\text{flip}(x))$ (and vice versa), either at inference or as a consistency loss during training. Note: ViT token features are not flip-equivariant, and fencers do not stay on fixed screen halves due to camera pans and center-line crossings.
-- **End-Weighted Temporal Sampling**: Allocates 25% of sampled frames to approach footwork and 75% densely over the second half of the clip (~3.5 s at 13 fps). Also supports uniform-window sampling around the touch onset with configurable `onset_window`.
+- **Temporal Sampling**: The default `onset_window` mode samples frames evenly in a window around the light onset (`window_pre_s` before, `window_post_s` after). `end_weighted` (25% of frames early, 75% in the second half of the clip) and `uniform` remain available via `data.sampling_mode`.
 
 ---
 
@@ -135,6 +135,32 @@ python -m src evaluate data.weapon=foil
 ```
 
 Training saves the split assignment next to the checkpoint as `split_manifest.csv` (in `training.checkpoint_dir`). **Evaluation requires this file** and fails if it is missing: the test split is never recomputed at evaluation time. `eval.split` selects which split to evaluate (`test` by default). Evaluation writes `predictions_<split>.csv` and `metrics_<split>.json` to `eval.output_dir` (default: the checkpoint directory).
+
+### Splits and Configuration
+
+Defaults live in `configs/default.yaml`; every key can be overridden on the command line (`python -m src train key=value`).
+
+| Key | Default | Effect |
+| :--- | :--- | :--- |
+| `data.group_by` | `match` | clips of one match (or `tournament`) never span splits; splits are class-stratified at group level |
+| `data.split_seed`, `train_ratio`, `val_ratio`, `test_ratio` | 42, 0.7, 0.15, 0.15 | split reproducibility and sizes |
+| `data.use_manifest_split` | `false` | take the `split` column of the manifest if every row has one |
+| `data.cv_folds`, `data.cv_fold` | 0, 0 | grouped k-fold CV; with `cv_folds>0` fold `cv_fold` is test, the next fold val, the rest train |
+| `data.exclude_weapons` | `[epee]` | dropped when `data.weapon=multi` (epee has no right of way, #22) |
+| `data.sampling_mode` | `onset_window` | `onset_window` samples evenly in `[onset - window_pre_s, onset + window_post_s]`; `end_weighted` is denser in the second half; `uniform` spans the whole clip. `onset_window` needs `light_frame_in_clip` and `clip_fps` in the manifest, else it falls back to `uniform` |
+| `data.window_pre_s`, `data.window_post_s` | 1.0, 0.25 | window around the light onset in seconds |
+| `data.overlay_mask.enabled` | `true` | blank the scoreboard and light rows before resize and flip |
+| `data.overlay_mask.y_min_frac` | 0.82 | first masked row as a fraction of frame height. When unset (`null`), it is derived from the overlay geometry in `configs/overlay/fie_default.yaml` (score digit top minus 14 px, 295/360) |
+| `training.seed` | 42 | seeds python, numpy, torch, shuffling and workers |
+| `training.selection_metric` | `macro_f1` | checkpoint selection and early stopping (`macro_f1` or `accuracy`) |
+| `eval.flip_tta` | `true` | average `f(x)` with the L/R-swapped `f(flip(x))` in validation and evaluation (2x forward passes); makes the prediction flip-consistent (#19) |
+| `eval.split` | `test` | split of the saved `split_manifest.csv` to evaluate |
+| `model.use_video`, `model.use_kinematics` | `true`, `true` | switch streams (ablation presets in `configs/experiment/`) |
+| `model.kinematics.cache_dir` | `data/kinematics` | cache written by `precompute-kinematics` |
+| `model.kinematics.settings` | `null` | overrides of the kinematics defaults (part of the cache key) |
+| `model.kinematics.compute_if_missing` | `false` | compute missing cache entries on the fly instead of raising |
+
+Overlay geometry (light boxes, score digit crops, thresholds) is configured per broadcast template in `configs/overlay/`.
 
 ---
 
