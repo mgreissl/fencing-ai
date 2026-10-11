@@ -164,6 +164,11 @@ eval:
   flip_tta: true
   # Bins for expected calibration error
   ece_bins: 10
+  # Hybrid prediction: clips whose lights decide the call (foil/sabre On-No = L,
+  # No-On = R; epee On-No = L, No-On = R, On-On = T) take the rule label; the
+  # model decides On-On and foil On-Off/Off-On. Clips without hit_type use the
+  # model. Metrics report the combined system and the model on ambiguous clips.
+  hybrid_rules: true
 
 # --- Augmentation ------------------------------------------------------------
 augmentation:

@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.metrics import (  # noqa: E402
     accuracy,
+    ambiguous_mask,
     bootstrap_ci,
     macro_f1,
     mcnemar_test,
@@ -35,6 +36,18 @@ def load_merged(paths: list[str]) -> dict:
     if len(set(merged["clip_path"])) != len(merged["clip_path"]):
         raise ValueError("duplicate clip_path across prediction files")
     return merged
+
+
+def select_view(data: dict, model_only: bool, ambiguous_only: bool) -> dict:
+    """Optionally score the raw model (not the hybrid system) and/or only the
+    ambiguous clips (On-On, foil On-Off/Off-On)."""
+    view = dict(data)
+    if model_only:
+        view["pred"] = data["model_pred"]
+    if ambiguous_only:
+        keep = ambiguous_mask(data["hit_type"], data["weapon"])
+        view = {k: v[keep] for k, v in view.items()}
+    return view
 
 
 def report_ci(name: str, data: dict, n_boot: int, seed: int) -> None:
@@ -60,15 +73,25 @@ def main() -> None:
         default=None,
         help="second system's predictions CSV(s) for a paired McNemar test",
     )
+    parser.add_argument(
+        "--model-only",
+        action="store_true",
+        help="score the raw model predictions instead of the hybrid system",
+    )
+    parser.add_argument(
+        "--ambiguous-only",
+        action="store_true",
+        help="only clips the lights do not decide (On-On, foil On-Off/Off-On)",
+    )
     parser.add_argument("--n-boot", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    a = load_merged(args.predictions)
+    a = select_view(load_merged(args.predictions), args.model_only, args.ambiguous_only)
     report_ci("A", a, args.n_boot, args.seed)
 
     if args.compare:
-        b = load_merged(args.compare)
+        b = select_view(load_merged(args.compare), args.model_only, args.ambiguous_only)
         report_ci("B", b, args.n_boot, args.seed)
         order_b = {c: i for i, c in enumerate(b["clip_path"])}
         shared = [i for i, c in enumerate(a["clip_path"]) if c in order_b]

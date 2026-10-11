@@ -244,3 +244,90 @@ def test_evaluation_report_light_only_is_weapon_aware():
         train_labels, train_hits, train_weapons=train_weapons,
     )
     assert rep["baselines"]["light_only"]["accuracy"] == pytest.approx(1.0)
+
+
+# --- Hybrid rule-based prediction (#50) -------------------------------------
+
+
+def test_rule_prediction_table():
+    from src.metrics import rule_prediction
+
+    assert rule_prediction("On-No", "foil") == 0
+    assert rule_prediction("No-On", "sabre") == 2
+    assert rule_prediction("On-No", "epee") == 0
+    assert rule_prediction("No-On", "epee") == 2
+    assert rule_prediction("On-On", "epee") == 1
+    for weapon in ("foil", "sabre"):
+        assert rule_prediction("On-On", weapon) is None
+    assert rule_prediction("On-Off", "foil") is None
+    assert rule_prediction("Off-On", "foil") is None
+    assert rule_prediction("", "foil") is None  # no hit_type -> model
+    assert rule_prediction("On-On", "") is None  # unknown weapon -> model
+
+
+def test_ambiguous_mask():
+    from src.metrics import ambiguous_mask
+
+    hits = ["On-On", "On-On", "On-Off", "Off-On", "On-No", "No-On", "", "On-On"]
+    weapons = ["foil", "epee", "foil", "foil", "foil", "sabre", "foil", "sabre"]
+    assert ambiguous_mask(hits, weapons).tolist() == [
+        True, False, True, True, False, False, False, True,
+    ]
+
+
+def test_hybrid_predict_overrides_only_rule_clips():
+    from src.metrics import hybrid_predict
+
+    model_pred = [2, 2, 0, 0, 0, 2]
+    hits = ["On-No", "No-On", "On-On", "On-On", "", "On-Off"]
+    weapons = ["foil", "foil", "foil", "epee", "foil", "foil"]
+    preds, from_rule = hybrid_predict(model_pred, hits, weapons)
+    assert preds.tolist() == [0, 2, 0, 1, 0, 2]
+    assert from_rule.tolist() == [True, True, False, True, False, False]
+
+
+def test_evaluation_report_hybrid_and_model_only():
+    from src.metrics import evaluation_report
+
+    y_true = [0, 2, 1, 0]
+    hits = ["On-No", "No-On", "On-On", "On-On"]
+    weapons = ["foil", "foil", "foil", "foil"]
+    model_pred = [2, 0, 1, 2]  # wrong on both single-light clips and last On-On
+    system_pred = [0, 2, 1, 2]
+    rep = evaluation_report(
+        y_true, system_pred, np.eye(3)[model_pred], hits, weapons,
+        [0, 1], ["On-No", "On-On"], model_pred=model_pred,
+    )
+    assert rep["overall"]["accuracy"] == pytest.approx(3 / 4)
+    assert rep["model_only"]["overall"]["accuracy"] == pytest.approx(1 / 4)
+    assert rep["ambiguous"]["n"] == 2
+    assert rep["ambiguous"]["accuracy"] == pytest.approx(0.5)
+    assert rep["model_only"]["ambiguous"]["accuracy"] == pytest.approx(0.5)
+
+
+def test_evaluation_report_ambiguous_without_model_pred():
+    from src.metrics import evaluation_report
+
+    rep = evaluation_report(
+        [0, 1], [0, 1], np.eye(3)[[0, 1]], ["On-No", "On-On"], ["foil", "foil"],
+        [0], ["On-No"],
+    )
+    assert rep["ambiguous"]["n"] == 1
+    assert "model_only" not in rep
+
+
+def test_predictions_roundtrip_with_source_columns(tmp_path):
+    from src.metrics import read_predictions, write_predictions
+
+    base = {
+        "clip_path": "a.mp4", "match_id": "m", "hit_type": "On-No", "weapon": "foil",
+        "label": "L", "pred": "L", "p_L": "0.1", "p_T": "0.1", "p_R": "0.8",
+    }
+    rows = [
+        {**base, "model_pred": "R", "source": "rule"},
+        base,  # legacy row without the new columns
+    ]
+    write_predictions(rows, tmp_path / "p.csv")
+    got = read_predictions(tmp_path / "p.csv")
+    assert got["model_pred"].tolist() == [2, 0]
+    assert got["source"].tolist() == ["rule", "model"]

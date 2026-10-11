@@ -156,8 +156,10 @@ def test_train_then_evaluate(tmp_path, experiment):
     metrics = json.loads((ckpt / "metrics_test.json").read_text(encoding="utf-8"))
     assert predictions.is_file()
     assert 0.0 <= metrics["overall"]["accuracy"] <= 1.0
+    assert metrics["ambiguous"]["n"] >= 0 and "model_only" in metrics
 
     with open(predictions, newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     assert len(rows) == 2
+    assert {r["source"] for r in rows} <= {"rule", "model"}
     assert {r["match_id"] for r in rows} == {"m6"}  # saved split, not recomputed

@@ -72,3 +72,19 @@ def test_prediction_rows_order_and_letters():
     assert [r["clip_path"] for r in rows] == ["a.mp4", "b.mp4"]
     assert rows[0]["label"] == "L" and rows[0]["pred"] == "T"
     assert rows[1]["match_id"] == "m2" and rows[1]["p_R"] == "0.900000"
+
+
+def test_prediction_rows_carry_system_and_model_pred():
+    recs = [ClipRecord("a.mp4", "L", "foil", match_id="m1", hit_type="On-No")]
+    rows = prediction_rows(
+        recs,
+        {
+            "all_labels": [0],
+            "all_preds": [2],  # raw model prediction
+            "all_probs": [[0.1, 0.1, 0.8]],
+            "system_preds": [0],
+            "from_rule": [True],
+        },
+    )
+    assert rows[0]["pred"] == "L" and rows[0]["model_pred"] == "R"
+    assert rows[0]["source"] == "rule"

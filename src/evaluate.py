@@ -21,7 +21,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.inference import predict_with_flip_tta
-from src.metrics import LABEL_LETTERS, evaluation_report, write_predictions
+from src.metrics import (
+    LABEL_LETTERS,
+    evaluation_report,
+    hybrid_predict,
+    write_predictions,
+)
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +136,10 @@ def log_results_to_wandb(
     if extra is not None:
         wandb.summary["test/macro_f1"] = extra["overall"]["macro_f1"]
         wandb.summary["test/ece"] = extra["overall"]["ece"]
+        wandb.summary["test/ambiguous_accuracy"] = extra["ambiguous"]["accuracy"]
+        wandb.summary["test/ambiguous_macro_f1"] = extra["ambiguous"]["macro_f1"]
+        if "model_only" in extra:
+            wandb.summary["test/model_only_accuracy"] = extra["model_only"]["overall"]["accuracy"]
         wandb.summary["test/baseline_majority_accuracy"] = extra["baselines"]["majority"]["accuracy"]
         wandb.summary["test/baseline_light_only_accuracy"] = extra["baselines"]["light_only"]["accuracy"]
         for hit, m in extra["per_hit_type"].items():
@@ -287,10 +296,22 @@ def _to_jsonable(obj):
 
 
 def prediction_rows(records: Sequence, results: dict) -> list[dict]:
-    """Per-clip rows for predictions.csv (records are in dataloader order)."""
+    """Per-clip rows for predictions.csv (records are in dataloader order).
+
+    ``pred`` is the system prediction (``system_preds`` if present, i.e. with
+    hybrid rules applied), ``model_pred`` the raw model output.
+    """
     rows = []
-    for rec, label, pred, probs in zip(
-        records, results["all_labels"], results["all_preds"], results["all_probs"]
+    model_preds = results["all_preds"]
+    system_preds = results.get("system_preds", model_preds)
+    from_rule = results.get("from_rule", [False] * len(model_preds))
+    for rec, label, model_pred, pred, rule, probs in zip(
+        records,
+        results["all_labels"],
+        model_preds,
+        system_preds,
+        from_rule,
+        results["all_probs"],
     ):
         rows.append(
             {
@@ -303,6 +324,8 @@ def prediction_rows(records: Sequence, results: dict) -> list[dict]:
                 "p_L": f"{probs[0]:.6f}",
                 "p_T": f"{probs[1]:.6f}",
                 "p_R": f"{probs[2]:.6f}",
+                "model_pred": LABEL_LETTERS[model_pred],
+                "source": "rule" if rule else "model",
             }
         )
     return rows
@@ -311,10 +334,22 @@ def prediction_rows(records: Sequence, results: dict) -> list[dict]:
 def _log_report(report: dict) -> None:
     overall = report["overall"]
     log.info(
-        f"Overall: acc={overall['accuracy']:.4f} macro_f1={overall['macro_f1']:.4f} "
+        f"Overall (system): acc={overall['accuracy']:.4f} macro_f1={overall['macro_f1']:.4f} "
         f"ECE={overall['ece']:.4f} recall(L/T/R)="
         + "/".join("n/a" if r != r else f"{r:.3f}" for r in overall["recall"])
     )
+    amb = report["ambiguous"]
+    log.info(
+        f"Ambiguous clips (On-On, foil On-Off/Off-On; model decides): n={amb['n']} "
+        f"acc={amb['accuracy']:.4f} macro_f1={amb['macro_f1']:.4f}"
+    )
+    model_only = report.get("model_only")
+    if model_only is not None:
+        mo = model_only["overall"]
+        log.info(
+            f"Model only (no rules): acc={mo['accuracy']:.4f} "
+            f"macro_f1={mo['macro_f1']:.4f}"
+        )
     log.info("Per hit type:")
     for name, m in report["per_hit_type"].items():
         log.info(f"  {name:<8} n={m['n']:<4} acc={m['accuracy']:.4f} macro_f1={m['macro_f1']:.4f}")
@@ -422,18 +457,31 @@ def main(cfg: DictConfig):
 
     # --- Print Results ---
     log.info(f"\n{'=' * 40}")
-    log.info(f"{eval_split.upper()} ACCURACY: {results['accuracy']:.4f} ({results['accuracy'] * 100:.1f}%)")
+    log.info(f"{eval_split.upper()} ACCURACY (model only): {results['accuracy']:.4f} ({results['accuracy'] * 100:.1f}%)")
     log.info(f"{eval_split.upper()} LOSS:     {results['loss']:.4f}")
     log.info(f"{'=' * 40}")
     log.info(f"\nClassification Report:\n{results['report_str']}")
     log.info(f"\nConfusion Matrix:\n{results['confusion_matrix']}")
 
+    hit_types = [r.hit_type for r in test_samples]
+    weapons = [r.weapon for r in test_samples]
+    system_preds = results["all_preds"]
+    if bool(getattr(cfg.eval, "hybrid_rules", False)):
+        system_preds, from_rule = hybrid_predict(results["all_preds"], hit_types, weapons)
+        results["from_rule"] = from_rule.tolist()
+        log.info(
+            f"Hybrid rules: {int(from_rule.sum())}/{len(from_rule)} clips decided "
+            "by the lights, the rest by the model"
+        )
+    results["system_preds"] = list(map(int, system_preds))
+
     report = evaluation_report(
         y_true=results["all_labels"],
-        y_pred=results["all_preds"],
+        y_pred=system_preds,
+        model_pred=results["all_preds"],
         probs=np.asarray(results["all_probs"]),
-        hit_types=[r.hit_type for r in test_samples],
-        weapons=[r.weapon for r in test_samples],
+        hit_types=hit_types,
+        weapons=weapons,
         train_labels=[r.label_id for r in train_samples],
         train_hit_types=[r.hit_type for r in train_samples],
         ece_bins=cfg.eval.ece_bins,

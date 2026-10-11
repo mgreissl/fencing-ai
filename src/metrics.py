@@ -212,6 +212,58 @@ def light_only_predict(
     return np.asarray(preds, dtype=np.int64)
 
 
+# --- Hybrid prediction: light rules plus model -------------------------------
+
+# Single-light clips are decided by the lights (same rules as the labelling in
+# scripts/preprocess_pipeline.py): On-No -> L, No-On -> R for every weapon; epee
+# On-On is a double hit (Tie).
+SINGLE_LIGHT_RULE = {"On-No": LEFT, "No-On": RIGHT}
+# Hit types whose label the lights do not determine (non-epee).
+AMBIGUOUS_HIT_TYPES = ("On-On", "On-Off", "Off-On")
+
+
+def rule_prediction(hit_type: str, weapon: str) -> Optional[int]:
+    """Label fixed by the lights alone, or None if the model must decide.
+
+    Clips without hit_type (or On-On with unknown weapon) return None.
+    """
+    if hit_type in SINGLE_LIGHT_RULE:
+        return SINGLE_LIGHT_RULE[hit_type]
+    if hit_type == "On-On" and weapon == "epee":
+        return TIE
+    return None
+
+
+def ambiguous_mask(
+    hit_types: Sequence[str], weapons: Sequence[str]
+) -> NDArray[np.bool_]:
+    """Clips the lights do not decide: On-On (not epee) and foil On-Off/Off-On."""
+    return np.asarray(
+        [
+            hit in AMBIGUOUS_HIT_TYPES and str(weapon) != "epee"
+            for hit, weapon in zip(hit_types, weapons)
+        ],
+        dtype=bool,
+    )
+
+
+def hybrid_predict(
+    model_pred: Sequence[int], hit_types: Sequence[str], weapons: Sequence[str]
+) -> tuple[NDArray[np.int64], NDArray[np.bool_]]:
+    """Rule prediction where the lights decide, else the model's.
+
+    Returns (predictions, from_rule mask).
+    """
+    preds = np.array(model_pred, dtype=np.int64)
+    from_rule = np.zeros(len(preds), dtype=bool)
+    for i, (hit, weapon) in enumerate(zip(hit_types, weapons)):
+        rule = rule_prediction(hit, str(weapon))
+        if rule is not None:
+            preds[i] = rule
+            from_rule[i] = True
+    return preds, from_rule
+
+
 # --- Uncertainty / paired tests ---------------------------------------------
 
 
@@ -271,6 +323,9 @@ def mcnemar_test(
 # --- Reporting / prediction files -------------------------------------------
 
 LABEL_LETTERS = ("L", "T", "R")
+# pred = final system prediction (rule where the lights decide, else model);
+# model_pred = raw model prediction; source = "rule" | "model". p_* are model
+# probabilities.
 PREDICTION_COLUMNS = (
     "clip_path",
     "match_id",
@@ -281,6 +336,8 @@ PREDICTION_COLUMNS = (
     "p_L",
     "p_T",
     "p_R",
+    "model_pred",
+    "source",
 )
 
 
@@ -294,6 +351,7 @@ def evaluation_report(
     train_hit_types: Sequence[str],
     ece_bins: int = 10,
     train_weapons: Optional[Sequence[str]] = None,
+    model_pred: Optional[Sequence[int]] = None,
 ) -> dict:
     """Overall, per-hit-type and per-weapon metrics plus rule baselines.
 
@@ -303,8 +361,15 @@ def evaluation_report(
       majority of that weapon, epee On-On -> Tie; clips with unknown hit_type
       -> train majority). Without ``train_weapons`` the On-On majority is
       pooled across weapons.
-    ``on_on`` reports the model's accuracy on On-On clips separately (None
+    ``on_on`` reports the system's accuracy on On-On clips separately (None
     if the evaluation set has none).
+
+    ``y_pred`` is the final system prediction. ``ambiguous`` scores it on the
+    clips the lights do not decide (On-On, foil On-Off/Off-On); the rules never
+    touch those, so it is the model's own accuracy there. With ``model_pred``
+    (the raw model output, differing from ``y_pred`` under hybrid rules) a
+    ``model_only`` block gives the model's metrics on all and on ambiguous
+    clips.
     """
     y_true = np.asarray(y_true, dtype=np.int64)
     y_pred = np.asarray(y_pred, dtype=np.int64)
@@ -328,11 +393,13 @@ def evaluation_report(
 
     per_hit = group_metrics(y_true, y_pred, hits)
     on_on_mask = hits == "On-On"
+    amb_mask = ambiguous_mask(hits, weapons)
     report = {
         "overall": classification_summary(y_true, y_pred, probs, ece_bins=ece_bins),
         "per_hit_type": per_hit,
         "per_weapon": group_metrics(y_true, y_pred, weapons),
         "on_on": per_hit.get("On-On"),
+        "ambiguous": classification_summary(y_true[amb_mask], y_pred[amb_mask]),
         "baselines": {
             "majority": {
                 **classification_summary(y_true, majority_pred),
@@ -345,10 +412,24 @@ def evaluation_report(
                     if on_on_mask.any()
                     else None
                 ),
+                "ambiguous_accuracy": (
+                    accuracy(y_true[amb_mask], light_pred[amb_mask])
+                    if amb_mask.any()
+                    else None
+                ),
                 "per_hit_type": group_metrics(y_true, light_pred, hits),
             },
         },
     }
+    if model_pred is not None:
+        model_pred = np.asarray(model_pred, dtype=np.int64)
+        report["model_only"] = {
+            "overall": classification_summary(
+                y_true, model_pred, probs, ece_bins=ece_bins
+            ),
+            "ambiguous": classification_summary(y_true[amb_mask], model_pred[amb_mask]),
+            "per_hit_type": group_metrics(y_true, model_pred, hits),
+        }
     return report
 
 
@@ -364,7 +445,8 @@ def write_predictions(rows: Sequence[dict], path) -> None:
         writer = csv.DictWriter(handle, fieldnames=list(PREDICTION_COLUMNS))
         writer.writeheader()
         for row in rows:
-            writer.writerow({k: row[k] for k in PREDICTION_COLUMNS})
+            full = {"model_pred": row["pred"], "source": "model", **row}
+            writer.writerow({k: full[k] for k in PREDICTION_COLUMNS})
 
 
 def read_predictions(path) -> dict[str, NDArray]:
@@ -382,6 +464,12 @@ def read_predictions(path) -> dict[str, NDArray]:
         "weapon": np.asarray([r["weapon"] for r in rows], dtype=object),
         "label": np.asarray([letter_id[r["label"]] for r in rows], dtype=np.int64),
         "pred": np.asarray([letter_id[r["pred"]] for r in rows], dtype=np.int64),
+        # older files lack these columns: model prediction = pred, source = model
+        "model_pred": np.asarray(
+            [letter_id[r.get("model_pred") or r["pred"]] for r in rows],
+            dtype=np.int64,
+        ),
+        "source": np.asarray([r.get("source") or "model" for r in rows], dtype=object),
         "probs": np.asarray(
             [[float(r["p_L"]), float(r["p_T"]), float(r["p_R"])] for r in rows],
             dtype=np.float64,
