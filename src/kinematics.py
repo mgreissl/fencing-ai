@@ -16,7 +16,8 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Optional, Union
+from dataclasses import dataclass
+from typing import Optional, Sequence, Union
 
 # COCO Keypoint indices
 NOSE = 0
@@ -33,6 +34,26 @@ R_ANKLE = 16
 
 _YOLO_MODEL = None
 
+# Settings that influence the extracted features. Every key is part of the
+# kinematics cache key, so changing any of them invalidates cached features.
+DEFAULT_KINEMATICS_SETTINGS: dict = {
+    "track_max_age": 15,
+    "track_max_distance": 0.75,
+    "y_band": [0.30, 0.78],
+    "min_box_height": 0.08,
+    "max_box_bottom": 0.95,
+    "min_track_coverage": 0.2,
+    "side_assignment_frames": 10,
+}
+
+
+def resolve_kinematics_settings(settings: Optional[dict] = None) -> dict:
+    """Merge user settings over ``DEFAULT_KINEMATICS_SETTINGS``."""
+    unknown = set(settings or {}) - set(DEFAULT_KINEMATICS_SETTINGS)
+    if unknown:
+        raise KeyError(f"Unknown kinematics settings: {sorted(unknown)}")
+    return {**DEFAULT_KINEMATICS_SETTINGS, **(settings or {})}
+
 
 def get_pose_model(model_name: str = "yolo11n-pose.pt"):
     """Lazy loader for YOLO pose estimation model."""
@@ -42,6 +63,304 @@ def get_pose_model(model_name: str = "yolo11n-pose.pt"):
 
         _YOLO_MODEL = YOLO(model_name)
     return _YOLO_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Detections and the YOLO adapter
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FrameDetections:
+    """
+    Person detections of a single frame, all coordinates normalized to [0, 1].
+
+    Attributes:
+        boxes: (N, 4) boxes as (x1, y1, x2, y2).
+        keypoints: (N, 17, 2) COCO keypoints as (x, y).
+        keypoint_conf: (N, 17) keypoint confidences.
+    """
+
+    boxes: np.ndarray
+    keypoints: np.ndarray
+    keypoint_conf: np.ndarray
+
+    @classmethod
+    def empty(cls) -> "FrameDetections":
+        return cls(
+            boxes=np.zeros((0, 4)),
+            keypoints=np.zeros((0, 17, 2)),
+            keypoint_conf=np.zeros((0, 17)),
+        )
+
+    def __len__(self) -> int:
+        return len(self.boxes)
+
+
+def pose_results_to_detections(result) -> FrameDetections:
+    """Convert one ultralytics pose ``Results`` object into ``FrameDetections``."""
+    h, w = result.orig_shape[:2]
+    if result.keypoints is None or result.boxes is None or len(result.boxes.xyxy) == 0:
+        return FrameDetections.empty()
+
+    scale = np.array([max(w, 1), max(h, 1)], dtype=np.float64)
+    boxes = result.boxes.xyxy.cpu().numpy().astype(np.float64).reshape(-1, 4)
+    boxes = boxes / np.tile(scale, 2)
+    kpts = result.keypoints.xy.cpu().numpy().astype(np.float64).reshape(-1, 17, 2)
+    kpts = kpts / scale
+    if result.keypoints.conf is None:
+        conf = np.ones(kpts.shape[:2])
+    else:
+        conf = result.keypoints.conf.cpu().numpy().astype(np.float64).reshape(-1, 17)
+    return FrameDetections(boxes=boxes, keypoints=kpts, keypoint_conf=conf)
+
+
+# ---------------------------------------------------------------------------
+# Tracking and fencer selection (#30)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PersonTrack:
+    """A tracked person: per-observation frame index, box and keypoints."""
+
+    frame_idx: np.ndarray  # (K,) int
+    boxes: np.ndarray  # (K, 4)
+    keypoints: np.ndarray  # (K, 17, 2)
+    keypoint_conf: np.ndarray  # (K, 17)
+
+    @property
+    def centers(self) -> np.ndarray:
+        return np.stack(
+            [
+                (self.boxes[:, 0] + self.boxes[:, 2]) / 2.0,
+                (self.boxes[:, 1] + self.boxes[:, 3]) / 2.0,
+            ],
+            axis=1,
+        )
+
+    @property
+    def heights(self) -> np.ndarray:
+        return self.boxes[:, 3] - self.boxes[:, 1]
+
+
+@dataclass
+class FencerTracks:
+    """
+    Full-rate pose of both fencers with fixed identities.
+
+    Index 0 on the fencer axis is the fencer who starts on the left, index 1
+    the fencer who starts on the right. Frames where a fencer was not detected
+    have ``detected == False`` and zero keypoints.
+
+    Attributes:
+        keypoints: (T, 2, 17, 2) normalized keypoints.
+        keypoint_conf: (T, 2, 17) keypoint confidences.
+        detected: (T, 2) bool, fencer present in frame.
+        fps: frame rate of the source clip.
+    """
+
+    keypoints: np.ndarray
+    keypoint_conf: np.ndarray
+    detected: np.ndarray
+    fps: float
+
+    @property
+    def num_frames(self) -> int:
+        return int(self.detected.shape[0])
+
+
+def _assign(cost: np.ndarray, max_cost: float) -> list[tuple[int, int]]:
+    """Minimum-cost assignment of rows to columns, dropping pairs above max_cost."""
+    if cost.size == 0:
+        return []
+    try:
+        from scipy.optimize import linear_sum_assignment
+
+        rows, cols = linear_sum_assignment(cost)
+        pairs = list(zip(rows.tolist(), cols.tolist()))
+    except ImportError:
+        pairs = []
+        used_r, used_c = set(), set()
+        for flat in np.argsort(cost, axis=None):
+            r, c = np.unravel_index(flat, cost.shape)
+            if r not in used_r and c not in used_c:
+                pairs.append((int(r), int(c)))
+                used_r.add(r)
+                used_c.add(c)
+    return [(r, c) for r, c in pairs if cost[r, c] <= max_cost]
+
+
+def track_detections(
+    detections: Sequence[FrameDetections],
+    max_age: int = 15,
+    max_distance: float = 0.75,
+) -> list[PersonTrack]:
+    """
+    Link per-frame detections into person tracks.
+
+    Uses a constant-velocity centroid tracker: each track predicts its box
+    centre for the current frame, and detections are assigned by minimum total
+    distance (normalized by box height). This keeps identities through crossings
+    and short occlusions, which per-frame x-sorting cannot.
+
+    Args:
+        detections: per-frame detections for consecutive frames.
+        max_age: frames a track may go unobserved before it is closed.
+        max_distance: gating threshold on centre distance / box height.
+
+    Returns:
+        List of tracks, in order of creation.
+    """
+    tracks: list[dict] = []
+    for t, det in enumerate(detections):
+        n_det = len(det)
+        centers = np.stack(
+            [(det.boxes[:, 0] + det.boxes[:, 2]) / 2.0, (det.boxes[:, 1] + det.boxes[:, 3]) / 2.0],
+            axis=1,
+        ) if n_det else np.zeros((0, 2))
+        heights = det.boxes[:, 3] - det.boxes[:, 1] if n_det else np.zeros(0)
+
+        active = [i for i, tr in enumerate(tracks) if t - tr["last_t"] <= max_age]
+        if active and n_det:
+            pred = np.stack(
+                [tracks[i]["center"] + tracks[i]["vel"] * (t - tracks[i]["last_t"]) for i in active]
+            )
+            track_h = np.array([tracks[i]["height"] for i in active])
+            dist = np.linalg.norm(pred[:, None, :] - centers[None, :, :], axis=-1)
+            norm = np.maximum(np.maximum(track_h[:, None], heights[None, :]), 1e-6)
+            pairs = _assign(dist / norm, max_distance)
+        else:
+            pairs = []
+
+        matched = set()
+        for r, c in pairs:
+            tr = tracks[active[r]]
+            dt = t - tr["last_t"]
+            vel = (centers[c] - tr["center"]) / dt
+            tr["vel"] = vel if tr["n"] == 1 else 0.5 * tr["vel"] + 0.5 * vel
+            tr["center"] = centers[c]
+            tr["height"] = heights[c]
+            tr["last_t"] = t
+            tr["n"] += 1
+            tr["obs"].append((t, c))
+            matched.add(c)
+
+        for c in range(n_det):
+            if c not in matched:
+                tracks.append(
+                    {
+                        "center": centers[c],
+                        "vel": np.zeros(2),
+                        "height": heights[c],
+                        "last_t": t,
+                        "n": 1,
+                        "obs": [(t, c)],
+                    }
+                )
+
+    out = []
+    for tr in tracks:
+        idx = np.array([t for t, _ in tr["obs"]], dtype=np.int64)
+        out.append(
+            PersonTrack(
+                frame_idx=idx,
+                boxes=np.stack([detections[t].boxes[c] for t, c in tr["obs"]]),
+                keypoints=np.stack([detections[t].keypoints[c] for t, c in tr["obs"]]),
+                keypoint_conf=np.stack([detections[t].keypoint_conf[c] for t, c in tr["obs"]]),
+            )
+        )
+    return out
+
+
+def select_fencer_tracks(
+    tracks: Sequence[PersonTrack],
+    num_frames: int,
+    y_band: Sequence[float] = (0.30, 0.78),
+    min_box_height: float = 0.08,
+    max_box_bottom: float = 0.95,
+    min_track_coverage: float = 0.2,
+    side_assignment_frames: int = 10,
+) -> tuple[Optional[PersonTrack], Optional[PersonTrack]]:
+    """
+    Pick the two tracks most likely to be the fencers and order them left/right.
+
+    A track is plausible if its median box centre lies in the piste band
+    ``y_band``, its median height is at least ``min_box_height``, its median box
+    bottom is above ``max_box_bottom`` (rejects a foreground referee) and it is
+    present in at least ``min_track_coverage`` of the frames (rejects flicker).
+    Plausible tracks are ranked by coverage x median height; the best two win.
+
+    Left/right is decided once per clip from the median x over the first
+    ``side_assignment_frames`` observations and then kept fixed. A single
+    plausible track is assigned by its side of the frame; the other fencer is
+    returned as ``None`` (never duplicated).
+
+    Returns:
+        (left_track, right_track), either may be None.
+    """
+    scored = []
+    for tr in tracks:
+        centers, heights = tr.centers, tr.heights
+        med_y = float(np.median(centers[:, 1]))
+        med_h = float(np.median(heights))
+        med_bottom = float(np.median(tr.boxes[:, 3]))
+        coverage = len(tr.frame_idx) / max(num_frames, 1)
+        if not (y_band[0] <= med_y <= y_band[1]):
+            continue
+        if med_h < min_box_height or med_bottom > max_box_bottom:
+            continue
+        if coverage < min_track_coverage:
+            continue
+        side_x = float(np.median(centers[:side_assignment_frames, 0]))
+        scored.append((coverage * med_h, side_x, tr))
+
+    scored.sort(key=lambda s: s[0], reverse=True)
+    chosen = scored[:2]
+    if not chosen:
+        return None, None
+    if len(chosen) == 1:
+        _, side_x, tr = chosen[0]
+        return (tr, None) if side_x < 0.5 else (None, tr)
+    chosen.sort(key=lambda s: s[1])
+    return chosen[0][2], chosen[1][2]
+
+
+def _tracks_to_arrays(
+    left: Optional[PersonTrack], right: Optional[PersonTrack], num_frames: int, fps: float
+) -> FencerTracks:
+    keypoints = np.zeros((num_frames, 2, 17, 2))
+    conf = np.zeros((num_frames, 2, 17))
+    detected = np.zeros((num_frames, 2), dtype=bool)
+    for slot, tr in enumerate((left, right)):
+        if tr is None:
+            continue
+        keypoints[tr.frame_idx, slot] = tr.keypoints
+        conf[tr.frame_idx, slot] = tr.keypoint_conf
+        detected[tr.frame_idx, slot] = True
+    return FencerTracks(keypoints=keypoints, keypoint_conf=conf, detected=detected, fps=float(fps))
+
+
+def track_fencers(
+    detections: Sequence[FrameDetections],
+    fps: float,
+    settings: Optional[dict] = None,
+) -> FencerTracks:
+    """Track people over all frames and return both fencers with fixed identities."""
+    cfg = resolve_kinematics_settings(settings)
+    tracks = track_detections(
+        detections, max_age=cfg["track_max_age"], max_distance=cfg["track_max_distance"]
+    )
+    left, right = select_fencer_tracks(
+        tracks,
+        len(detections),
+        y_band=cfg["y_band"],
+        min_box_height=cfg["min_box_height"],
+        max_box_bottom=cfg["max_box_bottom"],
+        min_track_coverage=cfg["min_track_coverage"],
+        side_assignment_frames=cfg["side_assignment_frames"],
+    )
+    return _tracks_to_arrays(left, right, len(detections), fps)
 
 
 def _get_fencer_metrics(kpts: np.ndarray, is_left_fencer: bool) -> tuple[np.ndarray, np.ndarray, float]:
