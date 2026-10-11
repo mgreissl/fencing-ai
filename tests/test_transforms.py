@@ -169,3 +169,20 @@ def test_affine_blur_config_keys():
     transform = build_train_transforms(cfg)
     assert transform.affine_transform is not None
     assert transform.blur_transform is None  # blur off by default
+
+
+@pytest.mark.parametrize("label, expected", [(0, 2), (1, 1), (2, 0)])
+def test_flip_swaps_left_right_labels_and_keeps_tie(label, expected):
+    transform = TrainVideoTransform(frame_size=16, flip_prob=1.0, color_jitter=False)
+    _, out_label = transform(_clip(), label=label)
+    assert out_label == expected
+
+
+def test_flip_transform_flips_kinematics_consistently_with_label():
+    from src.kinematics import KINEMATIC_FEATURE_DIM, flip_kinematic_features
+
+    transform = TrainVideoTransform(frame_size=16, flip_prob=1.0, color_jitter=False)
+    kin = torch.randn(6, KINEMATIC_FEATURE_DIM)
+    _, label, out_kin = transform(_clip(), label=0, kinematics=kin)
+    assert label == 2
+    torch.testing.assert_close(out_kin, flip_kinematic_features(kin))
