@@ -13,7 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.inference import predict_with_flip_tta
+from src.inference import autocast_context, predict_with_flip_tta
 from src.metrics import ambiguous_macro_f1, macro_f1, per_class_recall
 from src.seed import make_generator, seed_everything, seed_worker
 
@@ -173,8 +173,7 @@ def _train_one_epoch(
         optimizer.zero_grad()
 
         # Mixed precision forward (CUDA and Apple Silicon MPS)
-        amp_device = "cuda" if device.type == "cuda" else ("mps" if device.type == "mps" else "cpu")
-        with torch.amp.autocast(device_type=amp_device, enabled=use_amp and device.type in ["cuda", "mps"]):
+        with autocast_context(device, use_amp):
             logits = model(pixel_values, weapon_id=weapon_ids, kinematics=kinematics)
             loss = criterion(logits, labels)
 
@@ -238,6 +237,7 @@ def _validate(
     """
     model.eval()
     flip_tta = bool(getattr(getattr(cfg, "eval", None), "flip_tta", False))
+    use_amp = bool(cfg.training.mixed_precision)
     total_loss = 0.0
     correct = 0
     total = 0
@@ -255,8 +255,7 @@ def _validate(
         weapon_ids = torch.as_tensor(batch["weapon_id"], dtype=torch.long).to(device) if "weapon_id" in batch else None
         kinematics = batch["kinematics"].to(device) if "kinematics" in batch else None
 
-        amp_device = "cuda" if device.type == "cuda" else ("mps" if device.type == "mps" else "cpu")
-        with torch.amp.autocast(device_type=amp_device, enabled=device.type in ["cuda", "mps"]):
+        with autocast_context(device, use_amp):
             if flip_tta:
                 logits = predict_with_flip_tta(model, pixel_values, weapon_ids, kinematics)
             else:

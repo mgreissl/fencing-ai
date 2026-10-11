@@ -20,7 +20,7 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.inference import predict_with_flip_tta
+from src.inference import autocast_context, predict_with_flip_tta
 from src.metrics import (
     LABEL_LETTERS,
     evaluation_report,
@@ -38,12 +38,14 @@ def evaluate(
     device: torch.device,
     class_names: list[str],
     flip_tta: bool = False,
+    use_amp: bool = False,
 ) -> dict:
     """
     Run full evaluation on a dataset.
 
     With ``flip_tta`` the logits are averaged with those of the mirrored clip
-    (see ``predict_with_flip_tta``).
+    (see ``predict_with_flip_tta``). ``use_amp`` (``training.mixed_precision``)
+    enables autocast on CUDA/MPS; off by default.
 
     Returns:
         Dict with all evaluation metrics and per-sample results.
@@ -64,8 +66,7 @@ def evaluate(
         weapon_ids = torch.as_tensor(batch["weapon_id"], dtype=torch.long).to(device) if "weapon_id" in batch else None
         kinematics = batch["kinematics"].to(device) if "kinematics" in batch else None
 
-        amp_device = "cuda" if device.type == "cuda" else ("mps" if device.type == "mps" else "cpu")
-        with torch.amp.autocast(device_type=amp_device, enabled=device.type in ["cuda", "mps"]):
+        with autocast_context(device, use_amp):
             if flip_tta:
                 logits = predict_with_flip_tta(model, pixel_values, weapon_ids, kinematics)
             else:
@@ -453,6 +454,7 @@ def main(cfg: DictConfig):
         device,
         class_names,
         flip_tta=bool(getattr(cfg.eval, "flip_tta", False)),
+        use_amp=bool(cfg.training.mixed_precision),
     )
 
     # --- Print Results ---

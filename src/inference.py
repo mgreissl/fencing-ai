@@ -6,6 +6,19 @@ import torch.nn as nn
 from src.kinematics import flip_kinematic_features
 
 
+def amp_enabled(use_amp: bool, device: torch.device) -> bool:
+    """Autocast only when requested (``training.mixed_precision``) and on CUDA/MPS."""
+    return bool(use_amp) and device.type in ("cuda", "mps")
+
+
+def autocast_context(device: torch.device, use_amp: bool):
+    """Autocast context shared by training, validation and evaluation."""
+    device_type = device.type if device.type in ("cuda", "mps") else "cpu"
+    return torch.amp.autocast(
+        device_type=device_type, enabled=amp_enabled(use_amp, device)
+    )
+
+
 def flip_logits_lr(logits: torch.Tensor) -> torch.Tensor:
     """Swap the Left and Right class entries (order L, T, R) of (..., 3) logits."""
     return logits[..., [2, 1, 0]]
