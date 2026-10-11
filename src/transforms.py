@@ -28,8 +28,9 @@ def mask_overlay(
     (default: ImageNet mean, i.e. zero after normalisation). Apply it to raw
     [0, 1] frames before resize and flip so no overlay pixels survive either.
 
-    The fraction is a config value (``data.overlay_mask.y_min_frac``, 0.82 =
-    295 / 360); the overlay geometry module can supply it per source later.
+    The fraction defaults to the overlay geometry
+    (``src.overlay.overlay_mask_y_min_frac``, 295 / 360 for ``fie_default``);
+    ``data.overlay_mask.y_min_frac`` overrides it when set.
 
     Args:
         frames: Tensor (..., C, H, W).
@@ -51,11 +52,21 @@ def mask_overlay(
 
 
 def _overlay_mask_frac(cfg) -> Optional[float]:
-    """``data.overlay_mask.y_min_frac`` if the mask is enabled, else None."""
+    """Mask start fraction if the mask is enabled, else None.
+
+    ``data.overlay_mask.y_min_frac`` wins when set; otherwise it is derived
+    from the overlay geometry (``data.overlay_mask.overlay``, default
+    ``fie_default``).
+    """
     mask = OmegaConf.select(cfg, "data.overlay_mask")
     if mask is None or not mask.get("enabled", False):
         return None
-    return float(mask.get("y_min_frac", 0.82))
+    frac = mask.get("y_min_frac")
+    if frac is not None:
+        return float(frac)
+    from src.overlay import overlay_mask_y_min_frac
+
+    return overlay_mask_y_min_frac(mask.get("overlay"))
 
 
 def build_train_transforms(cfg) -> "TrainVideoTransform":

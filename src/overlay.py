@@ -314,3 +314,23 @@ def read_score(
         return None
     classes = getattr(classifier, "classes", np.arange(proba.shape[1]))
     return ScoreRead(int(classes[best[0]]), int(classes[best[1]]), confidence)
+
+
+SCORE_MASK_MARGIN_PX = 14
+
+
+def overlay_mask_y_min_frac(
+    cfg: OverlayConfig | str | Path | None = None,
+    margin_px: int = SCORE_MASK_MARGIN_PX,
+) -> float:
+    """First row to blank as a fraction of frame height, from overlay geometry.
+
+    The top of the score digit region minus ``margin_px``, divided by the
+    reference frame height (309 - 14 = 295 of 360 rows = 0.8194 for
+    ``fie_default``). Everything below it (scoreboard and light boxes) is masked.
+    """
+    if cfg is None or isinstance(cfg, (str, Path)):
+        cfg = load_overlay(DEFAULT_OVERLAY if cfg is None else cfg)
+    score_top = min(cfg.score_left[0], cfg.score_right[0])
+    y_min = min(score_top - margin_px, cfg.mask_band_y)
+    return y_min / cfg.frame_size[1]
