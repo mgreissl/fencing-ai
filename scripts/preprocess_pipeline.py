@@ -70,34 +70,111 @@ def check_score(frame):
     return None if read is None else (read.left, read.right)
 
 
-def determine_label(hit_type, left, right, next_left, next_right, weapon="foil"):
-    """Determine L, R, or T priority label based on scoreboard change."""
+# Label semantics (the class is the referee's decision, read from the score):
+#
+# Foil and sabre award the point by priority (right of way). The label is the
+# fencer who was awarded the touch:
+#   L / R  the left / right score went up by exactly one.
+#   T      both on-target lights, score unchanged after the decision window:
+#          simultaneous action, no touch awarded. This also contains annulled
+#          touches (for example after a video review), which cannot be told
+#          apart from the video.
+#   Foil only, one on-target and one off-target light: the off-target hit does
+#   not score, so the score only goes up for the on-target fencer if he had
+#   priority (On-Off +1 left -> L). If the score stays unchanged the referee
+#   gave priority to the off-target fencer (On-Off -> R, Off-On -> L).
+#
+# Epee has no priority; both touches count. The label is who was hit:
+#   L / R  single light and that fencer's score went up by one.
+#   T      both lights and both scores went up by one (double touch).
+#
+# Everything else is rejected, not labelled: negative changes, jumps of more
+# than one point (cards, penalties, corrections), both scores up in foil or
+# sabre, a score change for a fencer whose light was not lit, a single light
+# without score change (annulled or card), epee with both lights but no or
+# only one point, and hit types that cannot be mapped (off-target only).
+
+LABEL_HIT_TYPES = {
+    "foil": ("On-On", "On-No", "No-On", "On-Off", "Off-On"),
+    "sabre": ("On-On", "On-No", "No-On"),
+    "epee": ("On-On", "On-No", "No-On"),
+}
+
+
+@dataclass(frozen=True)
+class LabelDecision:
+    """A label (L/T/R) or the reason why the exchange is not labellable."""
+
+    label: str = None
+    reason: str = None
+
+
+def _reject(reason):
+    return LabelDecision(None, reason)
+
+
+def label_exchange(hit_type, before, after, weapon="foil"):
+    """Label one exchange from the light pattern and the score change.
+
+    ``before`` and ``after`` are (left, right) scores; ``after`` must be the
+    stabilised, confirmed score (see ``resolve_score_after``).
+    """
+    delta_left, delta_right = after[0] - before[0], after[1] - before[1]
+    if delta_left < 0 or delta_right < 0:
+        return _reject("negative_score_change")
+    if delta_left > 1 or delta_right > 1:
+        return _reject("score_jump_gt_one")
+    if hit_type not in LABEL_HIT_TYPES.get(weapon, ()):
+        return _reject("hit_type_not_labellable")
+    delta = (delta_left, delta_right)
+
+    if weapon == "epee":
+        return _label_epee(hit_type, delta)
+    return _label_priority(hit_type, delta)
+
+
+def _label_epee(hit_type, delta):
     if hit_type == "On-On":
-        if next_left - left == 1 and next_right - right == 0:
-            return "L"
-        if next_left - left == 0 and next_right - right == 1:
-            return "R"
-        if next_left - left == 0 and next_right - right == 0:
-            return "T"
-        if weapon == "epee" and next_left - left == 1 and next_right - right == 1:
-            return "T"
-    elif hit_type == "On-No":
-        if next_left - left == 1 and next_right - right == 0:
-            return "L"
-    elif hit_type == "No-On":
-        if next_left - left == 0 and next_right - right == 1:
-            return "R"
-    elif hit_type == "On-Off":
-        if next_left - left == 1 and next_right - right == 0:
-            return "L"
-        if next_left - left == 0 and next_right - right == 0:
-            return "R"
-    elif hit_type == "Off-On":
-        if next_left - left == 0 and next_right - right == 1:
-            return "R"
-        if next_left - left == 0 and next_right - right == 0:
-            return "L"
-    return None
+        if delta == (1, 1):
+            return LabelDecision("T")
+        if delta == (0, 0):
+            return _reject("no_score_change_both_lit")
+        return _reject("one_sided_score_both_lit")
+    if delta == (1, 1):
+        return _reject("both_scores_increased")
+    if hit_type == "On-No":
+        if delta == (1, 0):
+            return LabelDecision("L")
+    elif delta == (0, 1):  # No-On
+        return LabelDecision("R")
+    if delta == (0, 0):
+        return _reject("single_light_no_score_change")
+    return _reject("score_inconsistent_with_lights")
+
+
+def _label_priority(hit_type, delta):
+    if delta == (1, 1):
+        return _reject("both_scores_increased")
+    table = {
+        "On-On": {(1, 0): "L", (0, 1): "R", (0, 0): "T"},
+        "On-No": {(1, 0): "L"},
+        "No-On": {(0, 1): "R"},
+        "On-Off": {(1, 0): "L", (0, 0): "R"},
+        "Off-On": {(0, 1): "R", (0, 0): "L"},
+    }
+    label = table[hit_type].get(delta)
+    if label is not None:
+        return LabelDecision(label)
+    if delta == (0, 0):
+        return _reject("single_light_no_score_change")
+    return _reject("score_inconsistent_with_lights")
+
+
+def determine_label(hit_type, left, right, next_left, next_right, weapon="foil"):
+    """Label (L/T/R) or None; see ``label_exchange`` for the reason."""
+    return label_exchange(
+        hit_type, (left, right), (next_left, next_right), weapon
+    ).label
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +467,6 @@ def accepted_exchanges(exchanges):
     return [e for e in exchanges if e.accepted]
 
 
-LABELLABLE_HIT_TYPES = ("On-On", "On-No", "No-On", "On-Off", "Off-On")
 AFTER_REJECTION = {
     "unreadable": "score_unreadable_after",
     "unstable": "score_unstable_after",
@@ -439,9 +515,11 @@ def analyse_timeline(timeline, weapon, cfg=None):
         window = compute_window(onset, fps, cfg.pre_s, cfg.post_s,
                                 total_frames=timeline.n_frames,
                                 clip_fps=cfg.clip_fps)
-        if hit_type not in LABELLABLE_HIT_TYPES:
+        if hit_type not in LABEL_HIT_TYPES.get(weapon, ()):
             exchange.reason = (
-                "off_target_only" if "Off" in hit_type else "hit_type_not_labellable"
+                "off_target_only"
+                if "Off" in hit_type and "On" not in hit_type
+                else "hit_type_not_labellable"
             )
         elif window is None:
             exchange.reason = "window_outside_video"
@@ -452,12 +530,11 @@ def analyse_timeline(timeline, weapon, cfg=None):
         elif after.kind not in ("changed", "unchanged"):
             exchange.reason = AFTER_REJECTION[after.kind]
         else:
-            label = determine_label(hit_type, before[0], before[1],
-                                    after.score[0], after.score[1], weapon=weapon)
-            if label is None:
-                exchange.reason = "label_not_identifiable"
+            decision = label_exchange(hit_type, before, after.score, weapon)
+            if decision.label is None:
+                exchange.reason = decision.reason
             else:
-                exchange.label = label
+                exchange.label = decision.label
                 exchange.score_before, exchange.score_after = before, after.score
                 exchange.window = window
     return exchanges
