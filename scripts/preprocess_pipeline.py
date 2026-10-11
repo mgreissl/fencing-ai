@@ -878,7 +878,7 @@ def process_video_file(vid_path, output_dir, weapon="foil", cfg=None,
 def download_match(url, match_id, precut_dir):
     """Download a match in 360p; return (video_path, title) or (None, "")."""
     cmd = [
-        "yt-dlp",
+        sys.executable, "-m", "yt_dlp",
         "--remote-components", "ejs:github",
         "--cookies-from-browser", "firefox",
         "--sleep-requests", "1.5",
