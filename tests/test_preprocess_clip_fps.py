@@ -48,9 +48,11 @@ def test_analyse_uses_configured_clip_fps():
         runs=[(onset, onset + 90)],
         scores=lambda frame: (3, 2) if frame < onset + 10 else (4, 2),
     )
-    (cand,) = pp.analyse_timeline(timeline, "sabre", pp.PipelineConfig(clip_fps=15.0))
+    (cand,) = pp.accepted_exchanges(
+        pp.analyse_timeline(timeline, "sabre", pp.PipelineConfig(clip_fps=15.0))
+    )
     assert cand.window.clip_fps == 15.0
-    (native,) = pp.analyse_timeline(timeline, "sabre")
+    (native,) = pp.accepted_exchanges(pp.analyse_timeline(timeline, "sabre"))
     assert native.window.clip_fps == 30.0
 
 

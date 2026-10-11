@@ -205,8 +205,10 @@ class PipelineConfig:
     min_dark_s: float = 0.5       # lights must be off this long before an onset
     hit_window_s: float = 0.5     # lights are merged over this long after onset
     score_stride_s: float = 0.25  # scoreboard sampling interval
-    before_offsets_s: tuple = (-1.0, -0.5)  # score read before the onset
-    after_offsets_s: tuple = (1.2, 1.6)     # score read after the onset
+    n_stable_before: int = 3      # identical reads needed before the onset
+    n_stable_after: int = 4       # identical reads needed after the onset
+    score_timeout_s: float = 12.0  # wait this long for the referee decision
+    min_unchanged_s: float = 3.0  # unchanged score counts only after this long
 
 
 @dataclass
@@ -275,64 +277,190 @@ def scan_video(vid_path, weapon, cfg=None, score_reader=None):
     )
 
 
-def score_near(timeline, frame_index):
-    """Score sample closest to ``frame_index`` (None if unreadable/absent)."""
-    if len(timeline.score_frames) == 0:
-        return None
-    pos = int(np.argmin(np.abs(timeline.score_frames - frame_index)))
-    return timeline.scores[pos]
+# ---------------------------------------------------------------------------
+# Score stabilisation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AfterScore:
+    """Outcome of reading the scoreboard after a light onset.
+
+    kind: ``changed`` (new stable score), ``unchanged`` (stable and confirmed
+    unchanged), ``undecided`` (window closed too early to tell),
+    ``unstable`` (several changes or a revert) or ``unreadable``.
+    """
+
+    kind: str
+    score: tuple = None
+    decision_frame: int = None
+    closed_by: str = ""
+
+
+def _stable_runs(frames, scores, n_stable):
+    """Runs of at least ``n_stable`` consecutive identical reads.
+
+    Returns [(value, first_frame), ...]; adjacent runs with the same value
+    (for example split by a misread) are merged.
+    """
+    runs = []
+    current, count, first = None, 0, None
+    for frame, score in zip(frames, scores):
+        if score is not None and score == current:
+            count += 1
+        else:
+            current, count, first = score, (0 if score is None else 1), frame
+        if score is not None and count == n_stable:
+            if not runs or runs[-1][0] != current:
+                runs.append((current, int(first)))
+    return runs
+
+
+def read_score_before(frames, scores, onset, n_stable):
+    """Stable score just before the onset: (score, None) or (None, reason)."""
+    end = int(np.searchsorted(frames, onset, side="left"))
+    tail = scores[max(0, end - n_stable):end]
+    if len(tail) < n_stable or all(t is None for t in tail):
+        return None, "score_unreadable_before"
+    if any(t is None for t in tail) or any(t != tail[0] for t in tail):
+        return None, "score_unstable_before"
+    return tail[0], None
+
+
+def score_window_end(onset, next_onset, n_frames, fps, timeout_s):
+    """Last frame to read the post-touch score and why the window closed."""
+    timeout_end = onset + seconds_to_frames(timeout_s, fps)
+    candidates = [(timeout_end, "timeout"), (n_frames - 1, "video_end")]
+    if next_onset is not None:
+        candidates.append((next_onset - 1, "next_onset"))
+    return min(candidates, key=lambda c: c[0])
+
+
+def resolve_score_after(frames, scores, before, onset, end_frame, closed_by, fps,
+                        n_stable, min_unchanged_s):
+    """Read the scoreboard after a touch until it is stable or the window ends.
+
+    A change must hold for ``n_stable`` consecutive reads (single misreads are
+    ignored). An unchanged score is only reported once the window closed by
+    the next light or the timeout and at least ``min_unchanged_s`` were
+    observed; otherwise the decision may still be pending.
+    """
+    lo = int(np.searchsorted(frames, onset, side="right"))
+    hi = int(np.searchsorted(frames, end_frame, side="right"))
+    window_frames, window_scores = frames[lo:hi], scores[lo:hi]
+    runs = _stable_runs(window_frames, window_scores, n_stable)
+    if not runs:
+        return AfterScore("unreadable", closed_by=closed_by)
+
+    values = [value for value, _ in runs]
+    last_read = [x for x in window_scores if x is not None][-1]
+    if last_read != values[-1]:  # the scoreboard was still changing
+        return AfterScore("undecided", closed_by=closed_by)
+
+    if len(values) == 1 and values[0] == before:
+        observed_s = (end_frame - onset) / fps
+        if closed_by in ("next_onset", "timeout") and observed_s >= min_unchanged_s:
+            return AfterScore("unchanged", before, None, closed_by)
+        return AfterScore("undecided", closed_by=closed_by)
+    if len(values) == 1:
+        return AfterScore("changed", values[0], runs[0][1], closed_by)
+    if len(values) == 2 and values[0] == before and values[1] != before:
+        return AfterScore("changed", values[1], runs[1][1], closed_by)
+    return AfterScore("unstable", closed_by=closed_by)
 
 
 @dataclass
-class Candidate:
-    """One detected exchange with its outcome."""
+class Exchange:
+    """One detected light event with its label or rejection reason."""
 
     onset_frame: int
     hit_type: str
-    label: str
-    score_before: tuple
-    score_after: tuple
-    window: Window
+    label: str = None          # L/T/R, None if rejected
+    reason: str = None         # rejection reason, None if accepted
+    score_before: tuple = None
+    score_after: tuple = None
+    window: Window = None
+
+    @property
+    def accepted(self):
+        return self.label is not None
+
+
+def accepted_exchanges(exchanges):
+    """Exchanges that received a label."""
+    return [e for e in exchanges if e.accepted]
+
+
+LABELLABLE_HIT_TYPES = ("On-On", "On-No", "No-On", "On-Off", "Off-On")
+AFTER_REJECTION = {
+    "unreadable": "score_unreadable_after",
+    "unstable": "score_unstable_after",
+    "undecided": "score_unchanged_undecided",
+}
 
 
 def analyse_timeline(timeline, weapon, cfg=None):
-    """Turn a scanned timeline into labelled candidates (pure, no IO)."""
+    """Turn a scanned timeline into exchanges with labels or reasons (pure)."""
     cfg = cfg or PipelineConfig()
     fps = timeline.fps
+    frames, scores = timeline.score_frames, timeline.scores
     onsets = find_light_onsets(
         timeline.lit,
         seconds_to_frames(cfg.min_dark_s, fps),
         first_valid=timeline.first_valid,
     )
-    candidates = []
-    for onset in onsets:
+    exchanges = []
+    previous_undecided = False
+    for i, onset in enumerate(onsets):
+        next_onset = onsets[i + 1] if i + 1 < len(onsets) else None
         hit_end = onset + max(1, seconds_to_frames(cfg.hit_window_s, fps))
         hit_type = aggregate_hit_type(
             timeline.left_state[onset:hit_end], timeline.right_state[onset:hit_end]
         )
-        if hit_type not in ("On-On", "On-No", "No-On", "On-Off", "Off-On"):
-            continue
+        exchange = Exchange(onset, hit_type)
+        exchanges.append(exchange)
 
-        before = [score_near(timeline, onset + seconds_to_frames(o, fps))
-                  for o in cfg.before_offsets_s]
-        after = [score_near(timeline, onset + seconds_to_frames(o, fps))
-                 for o in cfg.after_offsets_s]
-        if before[0] is None or any(b != before[0] for b in before):
-            continue
-        if after[0] is None or any(a != after[0] for a in after):
-            continue
+        before, before_reason = read_score_before(frames, scores, onset,
+                                                  cfg.n_stable_before)
+        after = None
+        if before is not None:
+            end_frame, closed_by = score_window_end(
+                onset, next_onset, timeline.n_frames, fps, cfg.score_timeout_s
+            )
+            after = resolve_score_after(
+                frames, scores, before, onset, end_frame, closed_by, fps,
+                cfg.n_stable_after, cfg.min_unchanged_s,
+            )
+        was_undecided = previous_undecided
+        previous_undecided = bool(
+            after is not None and after.kind == "undecided"
+            and after.closed_by == "next_onset"
+        )
 
-        label = determine_label(hit_type, before[0][0], before[0][1],
-                                after[0][0], after[0][1], weapon=weapon)
-        if label is None:
-            continue
         window = compute_window(onset, fps, cfg.pre_s, cfg.post_s,
                                 total_frames=timeline.n_frames,
                                 clip_fps=cfg.clip_fps)
-        if window is None:
-            continue
-        candidates.append(Candidate(onset, hit_type, label, before[0], after[0], window))
-    return candidates
+        if hit_type not in LABELLABLE_HIT_TYPES:
+            exchange.reason = (
+                "off_target_only" if "Off" in hit_type else "hit_type_not_labellable"
+            )
+        elif window is None:
+            exchange.reason = "window_outside_video"
+        elif was_undecided:
+            exchange.reason = "previous_exchange_undecided"
+        elif before is None:
+            exchange.reason = before_reason
+        elif after.kind not in ("changed", "unchanged"):
+            exchange.reason = AFTER_REJECTION[after.kind]
+        else:
+            label = determine_label(hit_type, before[0], before[1],
+                                    after.score[0], after.score[1], weapon=weapon)
+            if label is None:
+                exchange.reason = "label_not_identifiable"
+            else:
+                exchange.label = label
+                exchange.score_before, exchange.score_after = before, after.score
+                exchange.window = window
+    return exchanges
 
 
 # ---------------------------------------------------------------------------
@@ -395,11 +523,11 @@ def process_video_file(vid_path, output_dir, weapon="foil", cfg=None):
         print(f"Video {vid_name} too short ({timeline.n_frames} frames), skipping.")
         return 0
 
-    candidates = analyse_timeline(timeline, weapon, cfg)
+    exchanges = accepted_exchanges(analyse_timeline(timeline, weapon, cfg))
     jobs = []
-    for n, cand in enumerate(candidates):
-        clip_id = f"{cand.label}_{weapon}_{vid_name}_{n}"
-        jobs.append((cand.window, os.path.join(output_dir, f"{clip_id}.mp4")))
+    for n, exchange in enumerate(exchanges):
+        clip_id = f"{exchange.label}_{weapon}_{vid_name}_{n}"
+        jobs.append((exchange.window, os.path.join(output_dir, f"{clip_id}.mp4")))
     saved = write_clips(vid_path, jobs)
 
     print(f"  Successfully labelled {len(saved)} {weapon.upper()} clips.")

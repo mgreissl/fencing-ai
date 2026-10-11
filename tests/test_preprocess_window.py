@@ -85,7 +85,7 @@ def test_analyse_timeline_emits_window_aligned_candidate():
         runs=[(onset, onset + 75)],
         scores=lambda frame: (3, 2) if frame < onset + 10 else (4, 2),
     )
-    candidates = pp.analyse_timeline(timeline, "sabre")
+    candidates = pp.accepted_exchanges(pp.analyse_timeline(timeline, "sabre"))
     assert len(candidates) == 1
     cand = candidates[0]
     assert (cand.onset_frame, cand.hit_type, cand.label) == (onset, "On-No", "L")
@@ -95,11 +95,11 @@ def test_analyse_timeline_emits_window_aligned_candidate():
 
 def test_analyse_timeline_skips_unreadable_scores():
     timeline = make_timeline(runs=[(1000, 1075)], scores=None)
-    assert pp.analyse_timeline(timeline, "sabre") == []
+    assert pp.accepted_exchanges(pp.analyse_timeline(timeline, "sabre")) == []
 
 
 def test_analyse_timeline_skips_window_before_video_start():
     timeline = make_timeline(
         runs=[(20, 95)], scores=lambda frame: (3, 2) if frame < 30 else (4, 2)
     )
-    assert pp.analyse_timeline(timeline, "sabre") == []
+    assert pp.accepted_exchanges(pp.analyse_timeline(timeline, "sabre")) == []
