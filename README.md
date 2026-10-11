@@ -27,7 +27,7 @@ This project expands upon work by Sholto Douglas in [SholtoD/fencing-AI](https:/
 - **Bilateral Spatial-Difference Pooling**: Resolves left-right orientation symmetry collapse by extracting global scene context combined with lateral difference features:
   $$\mathbf{z} = \left[ \mathbf{z}_{\text{global}}, \; \mathbf{z}_{\text{left}} - \mathbf{z}_{\text{right}} \right] \in \mathbb{R}^{1536}$$
   This feature representation is mathematically anti-symmetric under horizontal reflections ($\mathbf{z}_{\text{diff}} \to -\mathbf{z}_{\text{diff}}$), enforcing robust separation between Left and Right touches.
-- **End-Weighted Temporal Sampling**: Allocates 25% of sampled frames to approach footwork and 75% densely over the terminal blade clash (last 400–600 ms).
+- **End-Weighted Temporal Sampling**: Allocates 25% of sampled frames to approach footwork and 75% densely over the second half of the clip (~3.5 s at 13 fps). Also supports uniform-window sampling around the touch onset with configurable `onset_window`.
 
 ---
 
