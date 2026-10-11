@@ -64,23 +64,73 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Command Line Interface
+
+All steps run through one CLI, `python -m src <command>` (or `fencing-ai <command>` after `pip install -e .`). Arguments after the command are passed to the underlying module unchanged; `python -m src <command> --help` lists them.
+
+| Command | Runs | Purpose |
+| :--- | :--- | :--- |
+| `harvest` | `scripts/harvest_fencingvision.py` | collect and verify match URLs into `{weapon}_videos.txt` |
+| `preprocess` | `scripts/preprocess_pipeline.py` | download each match, cut clips at the light onset, label them, write the manifest |
+| `precompute-kinematics` | `scripts/precompute_kinematics.py` | cache pose-based kinematic features per clip |
+| `train` | `src/train.py` (Hydra) | train; `key=value` overrides |
+| `evaluate` | `src/evaluate.py` (Hydra) | evaluate a checkpoint on its saved split |
+| `bootstrap` | `scripts/bootstrap_eval.py` | match-level bootstrap CIs, paired McNemar test |
+| `ablation` | `scripts/run_ablation.py` | run the ablation grid (reports "not available" until the script exists) |
+| `audit-sample` / `audit-report` | `scripts/audit_sample.py` / `audit_report.py` | manual label audit |
+
+The numbered scripts `2-cut_and_label.py`, `6-train_AI.py` and `7-evaluate_AI.py` still work as thin wrappers that print a deprecation note. `0-find_vids.py` and `1-download_vids.py` were replaced by `harvest` and `preprocess` and moved to `legacy/` (see `legacy/README.md`).
+
 ### Video Ingestion & Action Extraction
 ```bash
-
-python 2-cut_and_label.py --weapon foil
+python -m src harvest --weapon foil --workers 3
+python -m src preprocess --weapon foil [--max-matches 20] [--pre-s 1.0] [--post-s 0.25] [--clip-fps 25]
 ```
+
+`preprocess` downloads each match itself (360p), saves clips at the source fps unless `--clip-fps` is given, and deletes the source video afterwards. Rejected exchanges are logged with a reason to `state/rejections_{weapon}.csv`, progress to `state/processed_{weapon}_urls.txt`.
+
+### Clip Manifest
+
+Every clip is described in `data/clips/{weapon}/manifest.csv` (one row per clip) instead of being encoded in its file name. Clip files are named after the video id.
+
+| Column | Meaning |
+| :--- | :--- |
+| `clip_path`, `label`, `weapon`, `match_id` | required: clip file, `L`/`T`/`R`, `foil`/`sabre`/`epee`, source match |
+| `source_url`, `tournament` | provenance; `tournament` enables `data.group_by=tournament` |
+| `hit_type` | light pattern: `On-On`, `On-No`, `No-On`, `On-Off`, `Off-On` |
+| `score_{left,right}_{before,after}` | scoreboard reads around the decision |
+| `light_time_s`, `light_frame_in_clip` | light onset in the source video and in the clip (used by `onset_window` sampling) |
+| `source_fps`, `clip_fps`, `n_frames` | timing of the saved clip |
+| `split` | optional; used when `data.use_manifest_split=true` and every row has one |
+
+If no manifest exists, clips are discovered by scanning `*.mp4` and parsing the legacy file name (no onset information, so sampling falls back to `uniform`).
+
+### Kinematics Cache
+
+The kinematic stream reads cached pose features. Fill the cache once before training (cache entries are keyed by clip and kinematics settings):
+
+```bash
+python -m src precompute-kinematics --clips_dir data/clips/foil --cache_dir data/kinematics
+```
+
+With `model.kinematics.compute_if_missing=false` (default) a missing cache entry raises an error; set it to `true` to compute pose features on the fly.
 
 ### Model Training & Evaluation
 ```bash
 # Train Foil model
-python 6-train_AI.py data.weapon=foil training.epochs=20 training.batch_size=4
+python -m src train data.weapon=foil training.epochs=20 training.batch_size=4
 
-# Train multi-weapon model
-python 6-train_AI.py data.weapon=multi training.epochs=25 training.batch_size=4
+# Train multi-weapon model (epee excluded by default, see data.exclude_weapons)
+python -m src train data.weapon=multi training.epochs=25 training.batch_size=4
 
-# Evaluate checkpoint against held-out test distribution
-python 7-evaluate_AI.py data.weapon=foil
+# Ablations: video only, kinematics only, both (configs/experiment/)
+python -m src train +experiment=video_only
+
+# Evaluate checkpoints/best_model.pt (training.checkpoint_dir) on its saved test split
+python -m src evaluate data.weapon=foil
 ```
+
+Training saves the split assignment next to the checkpoint as `split_manifest.csv` (in `training.checkpoint_dir`). **Evaluation requires this file** and fails if it is missing: the test split is never recomputed at evaluation time. `eval.split` selects which split to evaluate (`test` by default). Evaluation writes `predictions_<split>.csv` and `metrics_<split>.json` to `eval.output_dir` (default: the checkpoint directory).
 
 ---
 
