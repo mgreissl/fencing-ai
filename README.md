@@ -94,7 +94,13 @@ The preprocessing pipeline downloads FIE broadcast videos from YouTube with yt-d
 
 ---
 
-## 7. References
+## 7. Licensing
+
+The kinematic stream uses [ultralytics](https://github.com/ultralytics/ultralytics), which is licensed under **AGPL-3.0**. Distributing this project, or offering it as a network service, with ultralytics included triggers the AGPL obligations (source availability under a compatible license) unless an ultralytics enterprise license is obtained. The pose weights (`yolo11n-pose.pt`) are downloaded at runtime and fall under the same terms.
+
+---
+
+## 8. References
 
 [1] Tong, Z., Song, Y., Wang, J., & Wang, L. (2022). *VideoMAE: Masked Autoencoders are Data-Efficient Learners for Self-Supervised Video Pre-Training.* NeurIPS 2022. [[arXiv:2203.12602]](https://arxiv.org/abs/2203.12602)
 
