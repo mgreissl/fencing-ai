@@ -13,6 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from src.inference import predict_with_flip_tta
 from src.metrics import macro_f1, per_class_recall
 from src.seed import make_generator, seed_everything, seed_worker
 
@@ -201,6 +202,7 @@ def _validate(
     at configured intervals.
     """
     model.eval()
+    flip_tta = bool(getattr(getattr(cfg, "eval", None), "flip_tta", False))
     total_loss = 0.0
     correct = 0
     total = 0
@@ -220,7 +222,10 @@ def _validate(
 
         amp_device = "cuda" if device.type == "cuda" else ("mps" if device.type == "mps" else "cpu")
         with torch.amp.autocast(device_type=amp_device, enabled=device.type in ["cuda", "mps"]):
-            logits = model(pixel_values, weapon_id=weapon_ids, kinematics=kinematics)
+            if flip_tta:
+                logits = predict_with_flip_tta(model, pixel_values, weapon_ids, kinematics)
+            else:
+                logits = model(pixel_values, weapon_id=weapon_ids, kinematics=kinematics)
             loss = criterion(logits, labels)
 
         total_loss += loss.item() * labels.size(0)

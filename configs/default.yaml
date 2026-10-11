@@ -143,6 +143,9 @@ eval:
   split: "test"
   # Output directory for predictions/metrics (null = checkpoint_dir)
   output_dir: null
+  # Flip test-time averaging: mean of f(x) and L/R-swapped f(flip(x)); applied
+  # in validation and evaluation (2x forward passes)
+  flip_tta: true
   # Bins for expected calibration error
   ece_bins: 10
 

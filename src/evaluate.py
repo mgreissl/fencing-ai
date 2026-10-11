@@ -20,6 +20,7 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from src.inference import predict_with_flip_tta
 from src.metrics import LABEL_LETTERS, evaluation_report, write_predictions
 
 log = logging.getLogger(__name__)
@@ -31,9 +32,13 @@ def evaluate(
     dataloader: DataLoader,
     device: torch.device,
     class_names: list[str],
+    flip_tta: bool = False,
 ) -> dict:
     """
     Run full evaluation on a dataset.
+
+    With ``flip_tta`` the logits are averaged with those of the mirrored clip
+    (see ``predict_with_flip_tta``).
 
     Returns:
         Dict with all evaluation metrics and per-sample results.
@@ -56,7 +61,10 @@ def evaluate(
 
         amp_device = "cuda" if device.type == "cuda" else ("mps" if device.type == "mps" else "cpu")
         with torch.amp.autocast(device_type=amp_device, enabled=device.type in ["cuda", "mps"]):
-            logits = model(pixel_values, weapon_id=weapon_ids, kinematics=kinematics)
+            if flip_tta:
+                logits = predict_with_flip_tta(model, pixel_values, weapon_ids, kinematics)
+            else:
+                logits = model(pixel_values, weapon_id=weapon_ids, kinematics=kinematics)
             loss = criterion(logits, labels)
 
         probs = torch.softmax(logits, dim=-1)
@@ -404,7 +412,13 @@ def main(cfg: DictConfig):
 
     # --- Evaluate ---
     log.info(f"Evaluating on {len(test_dataset)} '{eval_split}' clips...")
-    results = evaluate(model, test_loader, device, class_names)
+    results = evaluate(
+        model,
+        test_loader,
+        device,
+        class_names,
+        flip_tta=bool(getattr(cfg.eval, "flip_tta", False)),
+    )
 
     # --- Print Results ---
     log.info(f"\n{'=' * 40}")
