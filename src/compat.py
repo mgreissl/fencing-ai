@@ -30,3 +30,28 @@ def _patch_hydra_for_python314():
 
 if sys.version_info >= (3, 14):
     _patch_hydra_for_python314()
+
+
+def _patch_argparse_check_help():
+    """
+    Skip argparse's help validation for non-str help objects (Python 3.14+).
+
+    Newer Hydra builds ``LazyCompletionHelp`` inside ``get_args_parser``, so it
+    cannot be replaced at module level; argparse would reject the object.
+    """
+    import argparse
+
+    original = getattr(argparse._ActionsContainer, "_check_help", None)
+    if original is None:
+        return
+
+    def _check_help(self, action):
+        if action.help is not None and not isinstance(action.help, str):
+            return
+        original(self, action)
+
+    argparse._ActionsContainer._check_help = _check_help
+
+
+if sys.version_info >= (3, 14):
+    _patch_argparse_check_help()
