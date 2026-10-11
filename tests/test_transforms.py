@@ -124,3 +124,48 @@ def test_flipped_masked_clip_has_no_overlay_pixels():
     assert torch.allclose(band, torch.zeros_like(band), atol=1e-4)
     # the scene itself is still present above the band
     assert out[:, 1, :10, :].abs().min() > 0
+
+
+def _plain(**kwargs):
+    return TrainVideoTransform(frame_size=32, flip_prob=0.0, color_jitter=False, **kwargs)
+
+
+def _textured_clip(n_frames=5):
+    return _clip(n_frames=n_frames, size=64, seed=3)
+
+
+def test_random_affine_same_params_for_all_frames_and_moves_content():
+    transform = _plain(random_affine=True, affine_translate=(0.2, 0.2), affine_scale=(0.8, 1.2))
+    clip = _textured_clip()
+    outputs = [transform(clip, 0)[0] for _ in range(4)]
+    for out in outputs:
+        for t in range(1, out.shape[0]):
+            assert torch.allclose(out[0], out[t], atol=1e-5)
+    baseline = _plain()(clip, 0)[0]
+    assert any(not torch.allclose(o, baseline, atol=1e-3) for o in outputs)
+
+
+def test_random_affine_disabled_is_identity_geometry():
+    clip = _textured_clip()
+    a, _ = _plain(random_affine=False)(clip, 0)
+    b, _ = _plain()(clip, 0)
+    assert torch.equal(a, b)
+
+
+def test_gaussian_blur_smooths_and_is_consistent():
+    clip = _textured_clip()
+    blurred, _ = _plain(gaussian_blur=True, blur_kernel_size=5, blur_sigma=(1.0, 2.0))(clip, 0)
+    plain, _ = _plain()(clip, 0)
+    assert blurred[0].std() < plain[0].std()
+    assert torch.allclose(blurred[0], blurred[-1], atol=1e-5)
+
+
+def test_affine_blur_config_keys():
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load("configs/default.yaml")
+    aff = cfg.augmentation.train.random_affine
+    assert aff.enabled and list(aff.translate) == [0.05, 0.05] and list(aff.scale) == [0.95, 1.05]
+    transform = build_train_transforms(cfg)
+    assert transform.affine_transform is not None
+    assert transform.blur_transform is None  # blur off by default

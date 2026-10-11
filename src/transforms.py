@@ -63,6 +63,12 @@ def build_train_transforms(cfg) -> "TrainVideoTransform":
     return TrainVideoTransform(
         frame_size=cfg.data.frame_size,
         overlay_mask_y_min_frac=_overlay_mask_frac(cfg),
+        random_affine=cfg.augmentation.train.random_affine.enabled,
+        affine_translate=tuple(cfg.augmentation.train.random_affine.translate),
+        affine_scale=tuple(cfg.augmentation.train.random_affine.scale),
+        gaussian_blur=cfg.augmentation.train.gaussian_blur.enabled,
+        blur_kernel_size=cfg.augmentation.train.gaussian_blur.kernel_size,
+        blur_sigma=tuple(cfg.augmentation.train.gaussian_blur.sigma),
         flip_prob=cfg.augmentation.train.horizontal_flip.prob
         if cfg.augmentation.train.horizontal_flip.enabled
         else 0.0,
@@ -100,6 +106,12 @@ class TrainVideoTransform:
         frame_size: int = 224,
         overlay_mask_y_min_frac: Optional[float] = None,
         flip_prob: float = 0.5,
+        random_affine: bool = False,
+        affine_translate: tuple = (0.05, 0.05),
+        affine_scale: tuple = (0.95, 1.05),
+        gaussian_blur: bool = False,
+        blur_kernel_size: int = 3,
+        blur_sigma: tuple = (0.1, 1.0),
         color_jitter: bool = True,
         brightness: float = 0.2,
         contrast: float = 0.2,
@@ -116,6 +128,24 @@ class TrainVideoTransform:
         self.resize = T.Resize(
             size=(frame_size, frame_size),
             antialias=True,
+        )
+        # Mild geometric jitter; v2 draws one parameter set per call, so every
+        # frame of the (T, C, H, W) clip is transformed identically. Uncovered
+        # borders are filled with the ImageNet mean (zero after normalisation).
+        self.affine_transform = (
+            T.RandomAffine(
+                degrees=0,
+                translate=tuple(affine_translate),
+                scale=tuple(affine_scale),
+                fill=IMAGENET_MEAN,
+            )
+            if random_affine
+            else None
+        )
+        self.blur_transform = (
+            T.GaussianBlur(kernel_size=blur_kernel_size, sigma=tuple(blur_sigma))
+            if gaussian_blur
+            else None
         )
         self.color_jitter_transform = (
             T.ColorJitter(
@@ -153,6 +183,12 @@ class TrainVideoTransform:
 
         # --- Direct Resize (preserves both fencers and entire piste) ---
         frames = torch.stack([self.resize(f) for f in frames])
+
+        # --- Mild affine (translate/scale) and blur, same for all frames ---
+        if self.affine_transform is not None:
+            frames = self.affine_transform(frames)
+        if self.blur_transform is not None:
+            frames = self.blur_transform(frames)
 
         # --- Random Horizontal Flip (with label & kinematics swap) ---
         if random.random() < self.flip_prob:

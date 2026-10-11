@@ -147,6 +147,15 @@ eval:
 augmentation:
   # Training augmentations
   train:
+    # Small translate/scale jitter (fractions); identical for all frames of a clip
+    random_affine:
+      enabled: true
+      translate: [0.05, 0.05]
+      scale: [0.95, 1.05]
+    gaussian_blur:
+      enabled: false
+      kernel_size: 3
+      sigma: [0.1, 1.0]
     horizontal_flip:
       enabled: true
       prob: 0.5
