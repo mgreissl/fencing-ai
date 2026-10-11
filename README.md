@@ -26,7 +26,7 @@ This project expands upon work by Sholto Douglas in [SholtoD/fencing-AI](https:/
 - **Parameter-Efficient Fine-Tuning**: Rank-8 LoRA adapters applied to query/value projections across layers 8–11 update only **0.58%** of model weights (~501K parameters) [2].
 - **Bilateral Spatial-Difference Pooling**: Resolves left-right orientation symmetry collapse by extracting global scene context combined with lateral difference features:
   $$\mathbf{z} = \left[ \mathbf{z}_{\text{global}}, \; \mathbf{z}_{\text{left}} - \mathbf{z}_{\text{right}} \right] \in \mathbb{R}^{1536}$$
-  This feature representation is mathematically anti-symmetric under horizontal reflections ($\mathbf{z}_{\text{diff}} \to -\mathbf{z}_{\text{diff}}$), enforcing robust separation between Left and Right touches.
+  This achieves approximate flip-relatedness through left-right difference features. Exact equivariance requires test-time averaging: average $p(L|x)$ with $p(R|\text{flip}(x))$ (and vice versa), either at inference or as a consistency loss during training. Note: ViT token features are not flip-equivariant, and fencers do not stay on fixed screen halves due to camera pans and center-line crossings.
 - **End-Weighted Temporal Sampling**: Allocates 25% of sampled frames to approach footwork and 75% densely over the second half of the clip (~3.5 s at 13 fps). Also supports uniform-window sampling around the touch onset with configurable `onset_window`.
 
 ---
