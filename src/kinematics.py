@@ -456,6 +456,59 @@ def compute_fencer_signals(
     )
 
 
+# ---------------------------------------------------------------------------
+# Missing detections: validity masks and gap filling (#29)
+# ---------------------------------------------------------------------------
+
+
+def contiguous_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return ``[(start, stop), ...]`` half-open index ranges where ``mask`` is True."""
+    padded = np.concatenate([[False], np.asarray(mask, dtype=bool), [False]])
+    edges = np.flatnonzero(np.diff(padded.astype(np.int8)))
+    return [(int(a), int(b)) for a, b in zip(edges[::2], edges[1::2])]
+
+
+def fill_short_gaps(
+    values: np.ndarray, valid: np.ndarray, max_gap: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Linearly interpolate internal gaps of at most ``max_gap`` invalid frames.
+
+    Gaps at the start or end of the clip are never extrapolated and longer gaps
+    stay invalid. Invalid entries of the result are zero, but they are flagged
+    by the returned mask and must never be used for derivatives.
+
+    Args:
+        values: (T, ...) per-frame values (arbitrary trailing dims).
+        valid: (T,) validity mask.
+        max_gap: maximum number of consecutive missing frames to fill.
+
+    Returns:
+        (filled_values, new_valid)
+    """
+    values = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(valid, dtype=bool)
+    new_valid = valid.copy()
+    n = len(valid)
+    if n and max_gap > 0 and valid.any():
+        valid_idx = np.flatnonzero(valid)
+        for start, stop in contiguous_runs(~valid):
+            if start > 0 and stop < n and stop - start <= max_gap:
+                new_valid[start:stop] = True
+        fill_idx = np.flatnonzero(new_valid & ~valid)
+        if len(fill_idx):
+            flat = values.reshape(n, -1)
+            interp = np.stack(
+                [np.interp(fill_idx, valid_idx, flat[valid_idx, j]) for j in range(flat.shape[1])],
+                axis=1,
+            )
+            flat = flat.copy()
+            flat[fill_idx] = interp
+            values = flat.reshape(values.shape)
+    mask = new_valid.reshape((n,) + (1,) * (values.ndim - 1))
+    return np.where(mask, values, 0.0), new_valid
+
+
 def _get_fencer_metrics(kpts: np.ndarray, is_left_fencer: bool) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Extract lead wrist position, torso position, and torso scale for a fencer.
