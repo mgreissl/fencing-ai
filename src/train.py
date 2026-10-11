@@ -69,6 +69,32 @@ def _selection_key(name: str) -> str:
     return SELECTION_METRICS[name]
 
 
+CLASS_WEIGHT_MODES = ("inverse_freq", "none")
+
+
+def build_class_weights(
+    train_labels, mode: str, n_classes: int = 3
+) -> "torch.Tensor | None":
+    """Loss class weights from the training labels only.
+
+    ``inverse_freq``: w_k = N / (K_present * n_k), so each present class has the
+    same total weight; a class absent from training gets weight 0.
+    ``none``: no weighting (returns None).
+    """
+    if mode not in CLASS_WEIGHT_MODES:
+        raise ValueError(
+            f"training.class_weights must be one of {list(CLASS_WEIGHT_MODES)}, "
+            f"got {mode!r}"
+        )
+    if mode == "none":
+        return None
+    counts = np.bincount(np.asarray(train_labels, dtype=np.int64), minlength=n_classes)
+    present = counts > 0
+    weights = np.zeros(n_classes, dtype=np.float64)
+    weights[present] = counts.sum() / (present.sum() * counts[present])
+    return torch.as_tensor(weights, dtype=torch.float32)
+
+
 def _selection_score(
     val_metrics: dict, name: str, warned: set
 ) -> tuple[float, str]:
@@ -562,7 +588,21 @@ def main(cfg: DictConfig):
     model = build_model(cfg).to(device)
 
     # --- Training Setup ---
-    criterion = nn.CrossEntropyLoss()
+    # Class weights come from the training split only; validation loss stays
+    # unweighted so it is comparable across runs.
+    class_weights = build_class_weights(
+        [r.label_id for r in train_samples],
+        str(getattr(cfg.training, "class_weights", "none")),
+    )
+    if class_weights is not None:
+        log.info(
+            "Class weights (L/T/R): "
+            + "/".join(f"{w:.3f}" for w in class_weights.tolist())
+        )
+    criterion = nn.CrossEntropyLoss(
+        weight=None if class_weights is None else class_weights.to(device)
+    )
+    val_criterion = nn.CrossEntropyLoss()
 
     # Only optimize trainable parameters
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -607,7 +647,7 @@ def main(cfg: DictConfig):
         val_metrics = _validate(
             model=model,
             dataloader=val_loader,
-            criterion=criterion,
+            criterion=val_criterion,
             device=device,
             epoch=epoch,
             wandb_active=wandb_active,

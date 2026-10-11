@@ -139,6 +139,10 @@ training:
   # selection; falls back to macro_f1 (warning) if the val split has none.
   selection_metric: "on_on_macro_f1"
 
+  # Loss class weights, computed from the training split only:
+  #   inverse_freq (w_k = N / (K * n_k)) | none. Validation loss is unweighted.
+  class_weights: "inverse_freq"
+
   batch_size: 4
   epochs: 20
   lr: 1.5e-4
