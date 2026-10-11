@@ -16,6 +16,7 @@ av==19.0.1
 peft==0.21.2
 opencv-python==5.0.0.93
 yt-dlp==2026.8.19
+truststore==0.10.4
 decord==0.6.0
 ultralytics==8.4.175
 scipy==1.18.1

@@ -91,7 +91,7 @@ python -m src harvest --weapon foil --workers 3
 python -m src preprocess --weapon foil [--max-matches 20] [--pre-s 1.0] [--post-s 0.25] [--clip-fps 25]
 ```
 
-`preprocess` downloads each match itself (360p, no cookies unless `--cookies-browser` or `--cookies-file` is given; `--remote-components` lets yt-dlp fetch its JS challenge solver), saves clips at the source fps unless `--clip-fps` is given, and deletes the source video afterwards. Rejected exchanges are logged with a reason to `state/rejections_{weapon}.csv`, progress to `state/processed_{weapon}_urls.txt`.
+`preprocess` downloads each match itself (360p, no cookies unless `--cookies-browser` or `--cookies-file` is given; `--remote-components` lets yt-dlp fetch its JS challenge solver). yt-dlp runs in a child process of the active interpreter with `truststore`, so the OS certificate store (including a corporate proxy CA) is used and TLS verification stays on. `--ca-file PEM` trusts a specific CA bundle instead; `--no-check-certificates` disables verification and is an insecure opt-in. On a failed download the tail of yt-dlp's error output is printed and stored in `state/failed_{weapon}.csv`. It saves clips at the source fps unless `--clip-fps` is given, and deletes the source video afterwards. Rejected exchanges are logged with a reason to `state/rejections_{weapon}.csv`, progress to `state/processed_{weapon}_urls.txt`.
 
 ### Clip Manifest
 

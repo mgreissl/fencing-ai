@@ -876,6 +876,35 @@ def process_video_file(vid_path, output_dir, weapon="foil", cfg=None,
 
 
 COOKIE_BROWSERS = ("none", "firefox", "edge", "chrome")
+ERROR_TAIL_LINES = 4
+ERROR_TAIL_CHARS = 500
+
+# yt-dlp runs in a child process of this interpreter. truststore makes it use
+# the OS certificate store (which holds the CA of a TLS-intercepting proxy);
+# certificate verification stays on. With an explicit CA file the OS store is
+# not used and yt-dlp's bundled certifi path points to that file instead.
+YTDLP_WRAPPER = """
+import os, sys
+ca_file = os.environ.get("FENCING_CA_FILE")
+if ca_file:
+    import certifi
+    certifi.where = lambda: ca_file
+else:
+    import truststore
+    truststore.inject_into_ssl()
+import yt_dlp
+yt_dlp.main(sys.argv[1:])
+"""
+
+
+class DownloadError(RuntimeError):
+    """yt-dlp failed; the message holds the tail of its error output."""
+
+
+def error_tail(stderr, max_lines=ERROR_TAIL_LINES, max_chars=ERROR_TAIL_CHARS):
+    """Last lines of yt-dlp's stderr as one bounded single-line string."""
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    return " | ".join(lines[-max_lines:])[-max_chars:]
 
 
 @dataclass
@@ -885,12 +914,16 @@ class DownloadOptions:
     cookies_browser: str = "none"   # none, firefox, edge or chrome
     cookies_file: str = None        # Netscape cookie file, wins over the browser
     remote_components: bool = False  # let yt-dlp fetch its JS challenge solver
+    ca_file: str = None             # extra/alternative CA bundle (PEM)
+    no_check_certificates: bool = False  # INSECURE: disables TLS verification
 
 
 def build_download_command(url, precut_dir, options=None):
     """yt-dlp command line for one match (360p, info json next to the video)."""
     options = options or DownloadOptions()
-    cmd = [sys.executable, "-m", "yt_dlp"]
+    cmd = [sys.executable, "-c", YTDLP_WRAPPER]
+    if options.no_check_certificates:
+        cmd += ["--no-check-certificates"]
     if options.remote_components:
         cmd += ["--remote-components", "ejs:github"]
     if options.cookies_file:
@@ -910,9 +943,16 @@ def build_download_command(url, precut_dir, options=None):
 
 def download_match(url, match_id, precut_dir, options=None):
     """Download a match in 360p; return (video_path, title) or (None, "")."""
+    options = options or DownloadOptions()
     cmd = build_download_command(url, precut_dir, options)
-    if sp.run(cmd).returncode != 0:
-        return None, ""
+    env = dict(os.environ)
+    if options.ca_file:
+        env["FENCING_CA_FILE"] = env["SSL_CERT_FILE"] = options.ca_file
+    result = sp.run(cmd, env=env, stderr=sp.PIPE, text=True, errors="replace")
+    if result.returncode != 0:
+        raise DownloadError(
+            error_tail(result.stderr) or f"yt-dlp exited with {result.returncode}"
+        )
 
     title = ""
     info_path = os.path.join(precut_dir, f"{match_id}.info.json")
@@ -967,7 +1007,13 @@ def run_pipeline(weapon="sabre", max_matches=None, cfg=None,
             record_failure(weapon, url, f"ValueError: {e}")
             continue
 
-        fpath, title = download_match(url, match_id, precut_dir, download_options)
+        try:
+            fpath, title = download_match(url, match_id, precut_dir,
+                                          download_options)
+        except DownloadError as e:
+            print(f"Failed to download {url}, skipping: {e}")
+            record_failure(weapon, url, f"download failed: {e}")
+            continue
         if fpath is None:
             print(f"Failed to download {url}, skipping.")
             record_failure(weapon, url, "download failed")
@@ -1024,6 +1070,13 @@ def add_cli_args(parser):
     parser.add_argument("--cookies-file", default=None,
                         help="Netscape cookie file for yt-dlp (overrides "
                              "--cookies-browser)")
+    parser.add_argument("--ca-file", default=None,
+                        help="PEM file with the CA certificate(s) to trust "
+                             "(for example a proxy CA); default: OS "
+                             "certificate store")
+    parser.add_argument("--no-check-certificates", action="store_true",
+                        help="INSECURE: disable TLS certificate verification "
+                             "(opt-in; prefer --ca-file)")
     parser.add_argument("--remote-components", action="store_true",
                         help="let yt-dlp download its JS challenge solver "
                              "(ejs:github); off by default")
@@ -1039,7 +1092,9 @@ def download_options_from_args(args):
     """Build DownloadOptions from parsed command line options."""
     return DownloadOptions(cookies_browser=args.cookies_browser,
                            cookies_file=args.cookies_file,
-                           remote_components=args.remote_components)
+                           remote_components=args.remote_components,
+                           ca_file=args.ca_file,
+                           no_check_certificates=args.no_check_certificates)
 
 
 if __name__ == "__main__":
