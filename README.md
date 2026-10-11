@@ -91,7 +91,7 @@ python -m src harvest --weapon foil --workers 3
 python -m src preprocess --weapon foil [--max-matches 20] [--pre-s 1.0] [--post-s 0.25] [--clip-fps 25]
 ```
 
-`preprocess` downloads each match itself (360p), saves clips at the source fps unless `--clip-fps` is given, and deletes the source video afterwards. Rejected exchanges are logged with a reason to `state/rejections_{weapon}.csv`, progress to `state/processed_{weapon}_urls.txt`.
+`preprocess` downloads each match itself (360p, no cookies unless `--cookies-browser` or `--cookies-file` is given; `--remote-components` lets yt-dlp fetch its JS challenge solver), saves clips at the source fps unless `--clip-fps` is given, and deletes the source video afterwards. Rejected exchanges are logged with a reason to `state/rejections_{weapon}.csv`, progress to `state/processed_{weapon}_urls.txt`.
 
 ### Clip Manifest
 
@@ -195,7 +195,7 @@ python -m src audit-report --sheet audit/audit_sheet.csv --output-json audit/rep
 
 ## 6. Data Source and Usage Restrictions
 
-The preprocessing pipeline downloads FIE broadcast videos from YouTube with yt-dlp, using browser cookies (`--cookies-from-browser firefox`) to avoid rate limiting.
+The preprocessing pipeline downloads FIE broadcast videos from YouTube with yt-dlp. By default it uses no cookies. If YouTube rate-limits or asks for a login, pass `--cookies-browser {firefox,edge,chrome}` or `--cookies-file PATH` (a Netscape cookie export; more robust than reading a running browser's locked database).
 
 - **YouTube Terms of Service**: automated downloading, in particular with session cookies, may conflict with YouTube's terms of service.
 - **Copyright**: the broadcast footage is owned by the FIE and the respective broadcasters. Whether a use is covered by a research exception depends on the jurisdiction and has not been clarified for this project.

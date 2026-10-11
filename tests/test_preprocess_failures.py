@@ -16,7 +16,7 @@ def run(tmp_path, monkeypatch):
     state = tmp_path / "state"
     marked = []
 
-    def fake_download(url, match_id, precut_dir):
+    def fake_download(url, match_id, precut_dir, *args):
         if url == BAD_DL_URL:
             return None, ""
         path = tmp_path / f"{match_id}.mp4"

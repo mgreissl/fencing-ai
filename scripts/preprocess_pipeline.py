@@ -875,12 +875,29 @@ def process_video_file(vid_path, output_dir, weapon="foil", cfg=None,
     return finish(len(saved))
 
 
-def download_match(url, match_id, precut_dir):
-    """Download a match in 360p; return (video_path, title) or (None, "")."""
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--remote-components", "ejs:github",
-        "--cookies-from-browser", "firefox",
+COOKIE_BROWSERS = ("none", "firefox", "edge", "chrome")
+
+
+@dataclass
+class DownloadOptions:
+    """How yt-dlp is called. The defaults need no browser and no cookies."""
+
+    cookies_browser: str = "none"   # none, firefox, edge or chrome
+    cookies_file: str = None        # Netscape cookie file, wins over the browser
+    remote_components: bool = False  # let yt-dlp fetch its JS challenge solver
+
+
+def build_download_command(url, precut_dir, options=None):
+    """yt-dlp command line for one match (360p, info json next to the video)."""
+    options = options or DownloadOptions()
+    cmd = [sys.executable, "-m", "yt_dlp"]
+    if options.remote_components:
+        cmd += ["--remote-components", "ejs:github"]
+    if options.cookies_file:
+        cmd += ["--cookies", options.cookies_file]
+    elif options.cookies_browser != "none":
+        cmd += ["--cookies-from-browser", options.cookies_browser]
+    cmd += [
         "--sleep-requests", "1.5",
         "-f", "18/134/best[height<=360]",
         "--no-warnings",
@@ -888,6 +905,12 @@ def download_match(url, match_id, precut_dir):
         "-o", os.path.join(precut_dir, "%(id)s.%(ext)s"),
         url,
     ]
+    return cmd
+
+
+def download_match(url, match_id, precut_dir, options=None):
+    """Download a match in 360p; return (video_path, title) or (None, "")."""
+    cmd = build_download_command(url, precut_dir, options)
     if sp.run(cmd).returncode != 0:
         return None, ""
 
@@ -903,9 +926,11 @@ def download_match(url, match_id, precut_dir):
     return None, title
 
 
-def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
+def run_pipeline(weapon="sabre", max_matches=None, cfg=None,
+                 download_options=None):
     """Main pipeline execution loop."""
     cfg = cfg or PipelineConfig()
+    download_options = download_options or DownloadOptions()
     urls_file = os.path.join(BASE_DIR, f"{weapon}_videos.txt")
     if not os.path.exists(urls_file):
         print(f"Error: {urls_file} not found.")
@@ -942,8 +967,7 @@ def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
             record_failure(weapon, url, f"ValueError: {e}")
             continue
 
-        # Download in 360p via Firefox cookies + Deno JS challenge solver
-        fpath, title = download_match(url, match_id, precut_dir)
+        fpath, title = download_match(url, match_id, precut_dir, download_options)
         if fpath is None:
             print(f"Failed to download {url}, skipping.")
             record_failure(weapon, url, "download failed")
@@ -994,6 +1018,15 @@ def add_cli_args(parser):
                         help="seconds kept after the light onset")
     parser.add_argument("--clip-fps", type=float, default=None,
                         help="fps of saved clips (default: native source fps)")
+    parser.add_argument("--cookies-browser", choices=COOKIE_BROWSERS,
+                        default="none",
+                        help="browser to read YouTube cookies from (default: none)")
+    parser.add_argument("--cookies-file", default=None,
+                        help="Netscape cookie file for yt-dlp (overrides "
+                             "--cookies-browser)")
+    parser.add_argument("--remote-components", action="store_true",
+                        help="let yt-dlp download its JS challenge solver "
+                             "(ejs:github); off by default")
 
 
 def config_from_args(args):
@@ -1002,8 +1035,16 @@ def config_from_args(args):
                           clip_fps=args.clip_fps)
 
 
+def download_options_from_args(args):
+    """Build DownloadOptions from parsed command line options."""
+    return DownloadOptions(cookies_browser=args.cookies_browser,
+                           cookies_file=args.cookies_file,
+                           remote_components=args.remote_components)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     add_cli_args(parser)
     args = parser.parse_args()
-    run_pipeline(args.weapon, args.max_matches, config_from_args(args))
+    run_pipeline(args.weapon, args.max_matches, config_from_args(args),
+                 download_options_from_args(args))
