@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from src.kinematics import KINEMATIC_FEATURE_DIM
+from src.kinematics import KINEMATIC_FEATURE_DIM, KINEMATIC_FEATURE_NAMES
 from transformers import VideoMAEForVideoClassification, VideoMAEConfig
 
 log = logging.getLogger(__name__)
@@ -58,20 +58,51 @@ class FencingClassificationHead(nn.Module):
         return self.head(x)
 
 
+# Fixed input scales that bring the kinematic features to roughly unit range.
+# Positions, extension and the validity channels are already O(1) and stay
+# unscaled; velocities are in image units per second and log-accelerations are
+# O(1-5). The values are order-of-magnitude constants, not fitted statistics.
+_VELOCITY_SCALE = 0.5  # 1 / (typical |v| of ~2 image units per second)
+_ACCELERATION_SCALE = 0.2  # 1 / (typical log(1 + |a|) of ~5)
+
+
+def _kinematic_input_scale(in_features: int) -> torch.Tensor:
+    """Per-feature scale vector; ones when the layout is not the standard one."""
+    scale = torch.ones(in_features)
+    if in_features != KINEMATIC_FEATURE_DIM:
+        return scale
+    for i, name in enumerate(KINEMATIC_FEATURE_NAMES):
+        if name.endswith(("_vx", "_vy")) or name == "closure":
+            scale[i] = _VELOCITY_SCALE
+        elif name.endswith("_acc"):
+            scale[i] = _ACCELERATION_SCALE
+    return scale
+
+
 class KinematicEncoder(nn.Module):
     """
-    Temporal 1D-CNN + LayerNorm encoder for fencer sword-arm kinematics (B, T, D_kin).
-    Captures temporal acceleration spikes, velocity differences, and arm extensions.
+    Temporal 1D-CNN encoder for fencer kinematics of shape (B, T, D_kin).
+
+    Features are scaled by fixed per-feature constants (validity channels stay
+    unscaled), then passed through two Conv1d blocks with GroupNorm(1, C),
+    which normalises per sample and so behaves identically for any batch size
+    and in train/eval mode.
     """
 
-    def __init__(self, in_features: int = KINEMATIC_FEATURE_DIM, hidden_dim: int = 64, out_dim: int = 128):
+    def __init__(
+        self,
+        in_features: int = KINEMATIC_FEATURE_DIM,
+        hidden_dim: int = 64,
+        out_dim: int = 128,
+    ):
         super().__init__()
+        self.register_buffer("input_scale", _kinematic_input_scale(in_features))
         self.conv = nn.Sequential(
             nn.Conv1d(in_features, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden_dim),
+            nn.GroupNorm(1, hidden_dim),
             nn.GELU(),
             nn.Conv1d(hidden_dim, out_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(out_dim),
+            nn.GroupNorm(1, out_dim),
             nn.GELU(),
             nn.AdaptiveAvgPool1d(1),
         )
@@ -81,8 +112,8 @@ class KinematicEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D_kin) -> transpose to (B, D_kin, T) for Conv1D
-        x = x.transpose(1, 2)
+        # x: (B, T, D_kin) -> scale, then transpose to (B, D_kin, T) for Conv1D
+        x = (x * self.input_scale).transpose(1, 2)
         feat = self.conv(x).squeeze(-1)  # (B, out_dim)
         return self.proj(feat)
 
