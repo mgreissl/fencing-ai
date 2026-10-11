@@ -84,7 +84,17 @@ python 7-evaluate_AI.py data.weapon=foil
 
 ---
 
-## 6. References
+## 6. Data Source and Usage Restrictions
+
+The preprocessing pipeline downloads FIE broadcast videos from YouTube with yt-dlp, using browser cookies (`--cookies-from-browser firefox`) to avoid rate limiting.
+
+- **YouTube Terms of Service**: automated downloading, in particular with session cookies, may conflict with YouTube's terms of service.
+- **Copyright**: the broadcast footage is owned by the FIE and the respective broadcasters. Whether a use is covered by a research exception depends on the jurisdiction and has not been clarified for this project.
+- **Redistribution**: do not redistribute downloaded videos, cut clips, or models trained on them without clarifying the rights first. Formal research access from the FIE is the cleanest option.
+
+---
+
+## 7. References
 
 [1] Tong, Z., Song, Y., Wang, J., & Wang, L. (2022). *VideoMAE: Masked Autoencoders are Data-Efficient Learners for Self-Supervised Video Pre-Training.* NeurIPS 2022. [[arXiv:2203.12602]](https://arxiv.org/abs/2203.12602)
 
