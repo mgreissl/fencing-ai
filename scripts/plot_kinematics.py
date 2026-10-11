@@ -21,6 +21,7 @@ Use --render to additionally write MP4 with render_velocity_trails overlay (slow
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 from typing import Optional, Sequence
 import warnings
@@ -30,6 +31,9 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend before importing pyplot
 import matplotlib.pyplot as plt
 import cv2
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 from src.manifest import (
     load_manifest,
@@ -43,8 +47,6 @@ from src.kinematics import (
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def find_feature_index(name: str) -> int:
