@@ -228,10 +228,18 @@ class FencingVideoMAE(nn.Module):
         else:
             self.classifier_in_features = self.video_feature_dim
 
-        # Learned weapon conditioning embedding (0=Foil, 1=Sabre, 2=Epee),
-        # added to the video features, or to the kinematic features without video
+        # Learned weapon conditioning embeddings (0=Foil, 1=Sabre, 2=Epee).
+        # Zero-initialised so the weapon signal starts as a no-op and is learned
+        # without drowning the left-right difference features at init.
+        # weapon_embed is added to the video features, or to the kinematic
+        # features without video; with both streams a second embedding
+        # conditions the kinematic stream.
         weapon_dim = self.video_feature_dim if use_video else self.kinematics_dim
         self.weapon_embed = nn.Embedding(3, weapon_dim)
+        nn.init.zeros_(self.weapon_embed.weight)
+        if use_video and use_kinematics:
+            self.kinematic_weapon_embed = nn.Embedding(3, self.kinematics_dim)
+            nn.init.zeros_(self.kinematic_weapon_embed.weight)
 
         # Custom classification head
         self.classifier = FencingClassificationHead(
@@ -308,6 +316,14 @@ class FencingVideoMAE(nn.Module):
         self.backbone_config = base_videomae.config
         log.info(f"Backbone hidden size: {backbone_hidden_size}")
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # Checkpoints from before the kinematic weapon embedding existed: a zero
+        # embedding reproduces their behaviour exactly.
+        key = prefix + "kinematic_weapon_embed.weight"
+        if hasattr(self, "kinematic_weapon_embed") and key not in state_dict:
+            state_dict[key] = torch.zeros_like(self.kinematic_weapon_embed.weight)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def _freeze_backbone(self):
         """Freeze all backbone parameters (encoder + fc_norm)."""
         for param in self.backbone.parameters():
@@ -360,6 +376,8 @@ class FencingVideoMAE(nn.Module):
                 if weapon_id is not None:
                     pooled = pooled + self.weapon_embed(weapon_id)
             else:
+                if weapon_id is not None:
+                    kin_feat = kin_feat + self.kinematic_weapon_embed(weapon_id)
                 pooled = torch.cat([pooled, kin_feat], dim=-1)
 
         # Classification logits

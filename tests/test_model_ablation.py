@@ -189,3 +189,42 @@ def test_model_allow_pool_fallback_flag():
     config = VideoMAEConfig(image_size=32, patch_size=16)
     pooled = bilateral_pool(torch.rand(1, 7, 4), config, allow_fallback=True)
     assert torch.equal(pooled[:, 4:], torch.zeros(1, 4))
+
+
+def test_weapon_embeddings_start_at_zero():
+    model = _tiny(use_kinematics=True, kinematics_out_dim=16).eval()
+    assert torch.count_nonzero(model.weapon_embed.weight) == 0
+    assert torch.count_nonzero(model.kinematic_weapon_embed.weight) == 0
+    pixel_values, _, kin = _inputs()
+    out = [
+        model(pixel_values, weapon_id=torch.full((2,), w), kinematics=kin)
+        for w in range(3)
+    ]
+    assert torch.equal(out[0], out[1]) and torch.equal(out[1], out[2])
+
+
+def test_kinematic_stream_gets_weapon_conditioning_with_video():
+    model = _tiny(use_kinematics=True, kinematics_out_dim=16).eval()
+    assert model.kinematic_weapon_embed.weight.shape == (3, 16)
+    torch.nn.init.normal_(model.kinematic_weapon_embed.weight)
+    pixel_values, _, kin = _inputs()
+    a = model(pixel_values, weapon_id=torch.zeros(2, dtype=torch.long), kinematics=kin)
+    b = model(pixel_values, weapon_id=torch.ones(2, dtype=torch.long), kinematics=kin)
+    assert not torch.allclose(a, b)
+
+
+def test_kinematics_only_weapon_embed_zero_and_no_extra_embedding():
+    model = _tiny(use_video=False, use_kinematics=True, backbone_config=None)
+    assert torch.count_nonzero(model.weapon_embed.weight) == 0
+    assert not hasattr(model, "kinematic_weapon_embed")
+
+
+def test_old_checkpoint_without_kinematic_weapon_embed_loads():
+    model = _tiny(use_kinematics=True, kinematics_out_dim=16)
+    old_state = {
+        k: v for k, v in model.state_dict().items() if "kinematic_weapon_embed" not in k
+    }
+    fresh = _tiny(use_kinematics=True, kinematics_out_dim=16)
+    torch.nn.init.normal_(fresh.kinematic_weapon_embed.weight)
+    fresh.load_state_dict(old_state)  # strict
+    assert torch.count_nonzero(fresh.kinematic_weapon_embed.weight) == 0
