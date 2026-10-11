@@ -11,11 +11,14 @@ Usage:
 """
 
 import argparse
-from scripts.preprocess_pipeline import run_pipeline
+from scripts.preprocess_pipeline import add_cli_args, config_from_args, run_pipeline
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weapon", choices=["foil", "sabre", "epee"], default="sabre")
-    parser.add_argument("--max-matches", type=int, default=None)
+    add_cli_args(parser)
     args = parser.parse_args()
-    run_pipeline(weapon=args.weapon, max_matches=args.max_matches)
+    run_pipeline(
+        weapon=args.weapon,
+        max_matches=args.max_matches,
+        cfg=config_from_args(args),
+    )

@@ -26,9 +26,3 @@ def test_seek_time_does_not_assume_25_fps():
     # Frame 30000 of a 30 fps video is t = 1000 s, not 1200 s (30000 / 25).
     assert pp.frame_to_seconds(30000, 30.0) == pytest.approx(1000.0)
     assert not math.isclose(pp.frame_to_seconds(30000, 30.0), 30000 / 25.0)
-
-
-def test_durations_scale_with_fps():
-    assert pp.seconds_to_frames(pp.JUMP_S, 25.0) == 260
-    assert pp.seconds_to_frames(pp.HIDE_S, 25.0) == 200
-    assert pp.seconds_to_frames(pp.HIDE_S, 30.0) == 240

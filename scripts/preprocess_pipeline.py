@@ -4,20 +4,23 @@ scripts/preprocess_pipeline.py — Multi-Weapon Preprocessing Pipeline.
 
 Processes match video URLs from {weapon}_videos.txt:
 1. Downloads match video in 360p via yt-dlp (with android client fallback).
-2. Detects touches via scoreboard light box triggers (red, green, white).
+2. Scans the video once: light state per frame, scoreboard digits at a stride.
 3. Auto-labels referee decision (L, R, T) from scoreboard digit OCR changes.
-4. Saves cut, labelled clips directly into data/clips/{weapon}/.
+4. Saves clips aligned to the light onset (PRE_S before to POST_S after, at
+   the source fps) into data/clips/{weapon}/.
 5. Removes match video immediately to conserve disk space.
 """
 
 import argparse
 import math
 import os
-import sys
-import cv2
 import subprocess as sp
-import numpy as np
+import sys
 import time
+from dataclasses import dataclass, field
+
+import cv2
+import numpy as np
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
@@ -31,11 +34,6 @@ OVERLAY = overlay.load_overlay(overlay.DEFAULT_OVERLAY)
 # Digit classifier (npz, pickle fallback) for scoreboard numbers 0-15.
 SCORE_CLASSIFIER = overlay.load_digit_classifier(cfg=OVERLAY)
 
-FFMPEG_BIN = "ffmpeg"
-FPS = 13
-# Raw cut geometry in seconds (frame counts depend on the source fps).
-JUMP_S = 10.4   # raw cut length and skip after a light
-HIDE_S = 8.0    # raw cut starts this long before the light
 INTRO_S = 60.0  # skipped at the start of every match video
 MIN_VIDEO_S = 100.0
 
@@ -102,161 +100,308 @@ def determine_label(hit_type, left, right, next_left, next_right, weapon="foil")
     return None
 
 
-def process_video_file(vid_path, output_dir, weapon="foil"):
-    """Cut and label exchanges from a single match video."""
-    vid_name = os.path.splitext(os.path.basename(vid_path))[0]
-    cap = cv2.VideoCapture(vid_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = validate_source_fps(cap.get(cv2.CAP_PROP_FPS))
-    cap.release()
+# ---------------------------------------------------------------------------
+# Pure helpers: windows, light onsets, hit type
+# ---------------------------------------------------------------------------
 
-    if fps is None:
+# Clip window around the light onset (seconds).
+PRE_S = 2.0
+POST_S = 0.3
+
+# Light state codes stored per frame in a Timeline.
+STATE_NO, STATE_ON, STATE_OFF = 0, 1, 2
+STATE_CODES = {"No": STATE_NO, "On": STATE_ON, "Off": STATE_OFF}
+
+
+@dataclass(frozen=True)
+class Window:
+    """Source frames of one saved clip, aligned to the light onset."""
+
+    src_indices: tuple
+    light_frame_in_clip: int  # 0-based index of the onset frame in the clip
+    clip_fps: float
+    source_fps: float
+
+    @property
+    def n_frames(self):
+        return len(self.src_indices)
+
+
+def compute_window(onset_frame, source_fps, pre_s=PRE_S, post_s=POST_S,
+                   total_frames=None):
+    """Window of ``pre_s`` before to ``post_s`` after the light onset.
+
+    Frames are taken at the native source fps. The onset frame is clip frame
+    ``round(pre_s * fps)``. Returns None if the window leaves the video.
+    """
+    n_pre = seconds_to_frames(pre_s, source_fps)
+    n_post = seconds_to_frames(post_s, source_fps)
+    start = onset_frame - n_pre
+    stop = onset_frame + n_post  # exclusive
+    if start < 0 or (total_frames is not None and stop > total_frames):
+        return None
+    return Window(
+        src_indices=tuple(range(start, stop)),
+        light_frame_in_clip=n_pre,
+        clip_fps=source_fps,
+        source_fps=source_fps,
+    )
+
+
+def find_light_onsets(lit, min_dark_frames, first_valid=0):
+    """Frame indices where a light starts after ``min_dark_frames`` of darkness.
+
+    ``lit`` is a per-frame boolean sequence. Frames before ``first_valid`` were
+    not evaluated, so an onset needs ``min_dark_frames`` evaluated dark frames
+    in front of it.
+    """
+    lit = np.asarray(lit, dtype=bool)
+    onsets = []
+    last_lit = first_valid - 1
+    for i in np.flatnonzero(lit):
+        i = int(i)
+        if i < first_valid:
+            continue
+        if i - last_lit > min_dark_frames and i - first_valid >= min_dark_frames:
+            onsets.append(i)
+        last_lit = i
+    return onsets
+
+
+def aggregate_hit_type(left_states, right_states):
+    """Combine per-frame light states of a short window into one hit type.
+
+    Per side the strongest state wins (On > Off > No), so a second light that
+    comes on a few frames after the first one is still part of the exchange.
+    """
+    def strongest(states):
+        states = set(int(s) for s in states)
+        if STATE_ON in states:
+            return "On"
+        if STATE_OFF in states:
+            return "Off"
+        return "No"
+
+    return f"{strongest(left_states)}-{strongest(right_states)}"
+
+
+# ---------------------------------------------------------------------------
+# Video scan: lights per frame, scoreboard sampled at a fixed stride
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineConfig:
+    """Tunable parameters of the preprocessing pipeline."""
+
+    pre_s: float = PRE_S
+    post_s: float = POST_S
+    intro_s: float = INTRO_S
+    min_dark_s: float = 0.5       # lights must be off this long before an onset
+    hit_window_s: float = 0.5     # lights are merged over this long after onset
+    score_stride_s: float = 0.25  # scoreboard sampling interval
+    before_offsets_s: tuple = (-1.0, -0.5)  # score read before the onset
+    after_offsets_s: tuple = (1.2, 1.6)     # score read after the onset
+
+
+@dataclass
+class Timeline:
+    """Per-frame light states and strided scoreboard reads of one video."""
+
+    fps: float
+    n_frames: int
+    first_valid: int
+    left_state: np.ndarray
+    right_state: np.ndarray
+    score_frames: np.ndarray
+    scores: list = field(default_factory=list)  # (left, right) or None
+
+    @property
+    def lit(self):
+        return (self.left_state != STATE_NO) | (self.right_state != STATE_NO)
+
+
+def scan_video(vid_path, weapon, cfg=None, score_reader=None):
+    """Read a video once: light state of every frame, scores at a stride.
+
+    Returns None if the video has no valid fps.
+    """
+    cfg = cfg or PipelineConfig()
+    score_reader = score_reader or check_score
+    cap = cv2.VideoCapture(vid_path)
+    try:
+        fps = validate_source_fps(cap.get(cv2.CAP_PROP_FPS))
+        if fps is None:
+            return None
+        stride = max(1, seconds_to_frames(cfg.score_stride_s, fps))
+        first_valid = seconds_to_frames(cfg.intro_s, fps)
+
+        left, right, score_frames, scores = [], [], [], []
+        idx = 0
+        while cap.grab():
+            frame = None
+            if idx >= first_valid:
+                ok, frame = cap.retrieve()
+                if not ok:
+                    frame = None
+            if frame is None:
+                left.append(STATE_NO)
+                right.append(STATE_NO)
+            else:
+                frame = overlay.normalize_frame(frame, OVERLAY)
+                state_left, state_right = overlay.light_states(frame, OVERLAY, weapon)
+                left.append(STATE_CODES[state_left])
+                right.append(STATE_CODES[state_right])
+                if idx % stride == 0:
+                    score_frames.append(idx)
+                    scores.append(score_reader(frame))
+            idx += 1
+    finally:
+        cap.release()
+
+    return Timeline(
+        fps=fps,
+        n_frames=idx,
+        first_valid=first_valid,
+        left_state=np.asarray(left, dtype=np.int8),
+        right_state=np.asarray(right, dtype=np.int8),
+        score_frames=np.asarray(score_frames, dtype=int),
+        scores=scores,
+    )
+
+
+def score_near(timeline, frame_index):
+    """Score sample closest to ``frame_index`` (None if unreadable/absent)."""
+    if len(timeline.score_frames) == 0:
+        return None
+    pos = int(np.argmin(np.abs(timeline.score_frames - frame_index)))
+    return timeline.scores[pos]
+
+
+@dataclass
+class Candidate:
+    """One detected exchange with its outcome."""
+
+    onset_frame: int
+    hit_type: str
+    label: str
+    score_before: tuple
+    score_after: tuple
+    window: Window
+
+
+def analyse_timeline(timeline, weapon, cfg=None):
+    """Turn a scanned timeline into labelled candidates (pure, no IO)."""
+    cfg = cfg or PipelineConfig()
+    fps = timeline.fps
+    onsets = find_light_onsets(
+        timeline.lit,
+        seconds_to_frames(cfg.min_dark_s, fps),
+        first_valid=timeline.first_valid,
+    )
+    candidates = []
+    for onset in onsets:
+        hit_end = onset + max(1, seconds_to_frames(cfg.hit_window_s, fps))
+        hit_type = aggregate_hit_type(
+            timeline.left_state[onset:hit_end], timeline.right_state[onset:hit_end]
+        )
+        if hit_type not in ("On-On", "On-No", "No-On", "On-Off", "Off-On"):
+            continue
+
+        before = [score_near(timeline, onset + seconds_to_frames(o, fps))
+                  for o in cfg.before_offsets_s]
+        after = [score_near(timeline, onset + seconds_to_frames(o, fps))
+                 for o in cfg.after_offsets_s]
+        if before[0] is None or any(b != before[0] for b in before):
+            continue
+        if after[0] is None or any(a != after[0] for a in after):
+            continue
+
+        label = determine_label(hit_type, before[0][0], before[0][1],
+                                after[0][0], after[0][1], weapon=weapon)
+        if label is None:
+            continue
+        window = compute_window(onset, fps, cfg.pre_s, cfg.post_s,
+                                total_frames=timeline.n_frames)
+        if window is None:
+            continue
+        candidates.append(Candidate(onset, hit_type, label, before[0], after[0], window))
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Clip writing
+# ---------------------------------------------------------------------------
+
+def write_clips(vid_path, jobs):
+    """Write clips for (Window, output_path) jobs with one sequential read.
+
+    Returns the output paths that received all their frames.
+    """
+    if not jobs:
+        return []
+    wanted = {}  # source frame -> job indices (once per occurrence)
+    for job_id, (window, _) in enumerate(jobs):
+        for src in window.src_indices:
+            wanted.setdefault(src, []).append(job_id)
+    last_needed = max(wanted)
+
+    width, height = OVERLAY.frame_size
+    writers, written = {}, [0] * len(jobs)
+    cap = cv2.VideoCapture(vid_path)
+    try:
+        idx = 0
+        while idx <= last_needed and cap.grab():
+            if idx in wanted:
+                ok, frame = cap.retrieve()
+                if not ok or frame is None:
+                    break
+                frame = overlay.normalize_frame(frame, OVERLAY)
+                for job_id in wanted[idx]:
+                    if job_id not in writers:
+                        window, path = jobs[job_id]
+                        writers[job_id] = cv2.VideoWriter(
+                            path, cv2.VideoWriter_fourcc(*"mp4v"),
+                            window.clip_fps, (width, height),
+                        )
+                    writers[job_id].write(frame)
+                    written[job_id] += 1
+            idx += 1
+    finally:
+        cap.release()
+        for writer in writers.values():
+            writer.release()
+
+    return [path for (window, path), n in zip(jobs, written)
+            if n == window.n_frames]
+
+
+def process_video_file(vid_path, output_dir, weapon="foil", cfg=None):
+    """Cut and label exchanges from a single match video."""
+    cfg = cfg or PipelineConfig()
+    vid_name = os.path.splitext(os.path.basename(vid_path))[0]
+
+    timeline = scan_video(vid_path, weapon, cfg)
+    if timeline is None:
         print(f"Video {vid_name} has no valid fps, skipping.")
         return 0
-
-    if total_frames < seconds_to_frames(MIN_VIDEO_S, fps):
-        print(f"Video {vid_name} too short ({total_frames} frames), skipping.")
+    if timeline.n_frames < seconds_to_frames(MIN_VIDEO_S, timeline.fps):
+        print(f"Video {vid_name} too short ({timeline.n_frames} frames), skipping.")
         return 0
 
-    jump_frames = seconds_to_frames(JUMP_S, fps)
-    hide_frames = seconds_to_frames(HIDE_S, fps)
-    cap_end_point = total_frames - jump_frames
-    position = seconds_to_frames(INTRO_S, fps)  # Skip intro
-    raw_clips = []
-    clip_count = 0
+    candidates = analyse_timeline(timeline, weapon, cfg)
+    jobs = []
+    for n, cand in enumerate(candidates):
+        clip_id = f"{cand.label}_{weapon}_{vid_name}_{n}"
+        jobs.append((cand.window, os.path.join(output_dir, f"{clip_id}.mp4")))
+    saved = write_clips(vid_path, jobs)
 
-    temp_clips_dir = os.path.join(BASE_DIR, f"temp_cut_clips_{weapon}")
-    os.makedirs(temp_clips_dir, exist_ok=True)
-
-    # 1. First pass: Identify light triggers and cut raw snippets
-    cap = cv2.VideoCapture(vid_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, position)
-
-    while position < cap_end_point:
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            break
-        position += 1
-
-        if frame.shape[:2] != (360, 640):
-            frame = cv2.resize(frame, (640, 360))
-
-        # Check for light illumination
-        try:
-            is_light = overlay.any_light(frame, OVERLAY, weapon)
-        except Exception:
-            is_light = False
-
-        if is_light:
-            out_clip = os.path.join(temp_clips_dir, f"temp_{vid_name}_{clip_count}.mp4")
-            clip_count += 1
-            raw_clips.append(out_clip)
-
-            # Extract ~10 s starting ~8 s before the light
-            clip_start_frame = max(0, position - hide_frames)
-            cmd = [
-                FFMPEG_BIN, "-y",
-                "-ss", str(frame_to_seconds(clip_start_frame, fps)),
-                "-i", vid_path,
-                "-t", str(JUMP_S),
-                "-r", str(FPS),
-                "-s", "640x360",
-                "-c:v", "libx264",
-                "-an",
-                out_clip
-            ]
-            sp.run(cmd, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-
-            # Jump forward
-            position += jump_frames
-            cap.set(cv2.CAP_PROP_POS_FRAMES, position)
-
-    cap.release()
-
-    if not raw_clips:
-        return 0
-
-    # 2. Second pass: Scoreboard verification & auto-labelling
-    labelled_count = 0
-    for clip_path in raw_clips:
-        if not os.path.exists(clip_path) or os.path.getsize(clip_path) == 0:
-            continue
-
-        c_cap = cv2.VideoCapture(clip_path)
-        c_frames = []
-        while True:
-            r, f = c_cap.read()
-            if not r or f is None:
-                break
-            if f.shape[:2] != (360, 640):
-                f = cv2.resize(f, (640, 360))
-            c_frames.append(f)
-        c_cap.release()
-
-        if len(c_frames) < 100:
-            continue
-
-        # Check light type at frame 70..100
-        hit_type = "No-No"
-        for f in c_frames[70:105]:
-            lt = check_lights(f, weapon=weapon)
-            if lt in ["On-On", "On-Off", "Off-On", "On-No", "No-On"]:
-                hit_type = lt
-                break
-
-        if hit_type == "No-No":
-            continue
-
-        # Score before touch (frames 20..40)
-        before_1 = check_score(c_frames[25])
-        before_2 = check_score(c_frames[35])
-        if before_1 is None or before_1 != before_2:
-            continue
-        left_1, right_1 = before_1
-
-        left_score, right_score = left_1, right_1
-
-        # Score after touch (around frame 120..130)
-        if len(c_frames) < 130:
-            continue
-
-        after_1 = check_score(c_frames[120])
-        after_2 = check_score(c_frames[125])
-        if after_1 is None or after_1 != after_2:
-            continue
-
-        next_left, next_right = after_1
-
-        # Determine label
-        label = determine_label(hit_type, left_score, right_score, next_left, next_right, weapon=weapon)
-        if label in ["L", "R", "T"]:
-            # Final clip: 90 frames preceding touch
-            frames_to_keep = c_frames[5:95]
-            if len(frames_to_keep) == 90:
-                clip_id = f"{label}_{weapon}_{vid_name}_{labelled_count}"
-                target_path = os.path.join(output_dir, f"{clip_id}.mp4")
-                out_writer = cv2.VideoWriter(
-                    target_path,
-                    cv2.VideoWriter_fourcc(*'mp4v'),
-                    FPS,
-                    (640, 360)
-                )
-                for frame_k in frames_to_keep:
-                    out_writer.write(frame_k)
-                out_writer.release()
-                labelled_count += 1
-
-    # Cleanup temp clips
-    for p in raw_clips:
-        if os.path.exists(p):
-            os.remove(p)
-
-    print(f"  Successfully labelled {labelled_count} {weapon.upper()} clips.")
-    return labelled_count
+    print(f"  Successfully labelled {len(saved)} {weapon.upper()} clips.")
+    return len(saved)
 
 
-def run_pipeline(weapon="sabre", max_matches=None):
+def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
     """Main pipeline execution loop."""
+    cfg = cfg or PipelineConfig()
     urls_file = os.path.join(BASE_DIR, f"{weapon}_videos.txt")
     if not os.path.exists(urls_file):
         print(f"Error: {urls_file} not found.")
@@ -310,7 +455,7 @@ def run_pipeline(weapon="sabre", max_matches=None):
             if fname.endswith(".mp4"):
                 fpath = os.path.join(precut_dir, fname)
                 try:
-                    count = process_video_file(fpath, clips_dir, weapon=weapon)
+                    count = process_video_file(fpath, clips_dir, weapon=weapon, cfg=cfg)
                     total_new_clips += count
                 except Exception as e:
                     print(f"Error processing {fname}: {e}")
@@ -333,9 +478,23 @@ def run_pipeline(weapon="sabre", max_matches=None):
     print("==========================================")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+def add_cli_args(parser):
+    """Register the command line options shared with 2-cut_and_label.py."""
     parser.add_argument("--weapon", choices=["foil", "sabre", "epee"], default="sabre")
     parser.add_argument("--max-matches", type=int, default=None)
+    parser.add_argument("--pre-s", type=float, default=PRE_S,
+                        help="seconds kept before the light onset")
+    parser.add_argument("--post-s", type=float, default=POST_S,
+                        help="seconds kept after the light onset")
+
+
+def config_from_args(args):
+    """Build a PipelineConfig from parsed command line options."""
+    return PipelineConfig(pre_s=args.pre_s, post_s=args.post_s)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    add_cli_args(parser)
     args = parser.parse_args()
-    run_pipeline(args.weapon, args.max_matches)
+    run_pipeline(args.weapon, args.max_matches, config_from_args(args))
