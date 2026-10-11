@@ -45,6 +45,11 @@ data:
   cv_folds: 0
   cv_fold: 0
 
+  # Clip validation at dataset build: 'exists' = file present (and one open to
+  # count frames when the manifest has no n_frames); 'full' = additionally open
+  # every clip and decode its first frame (finds corrupt files before training)
+  validate_clips: "exists"
+
   # Max clips to load (null = all): label-stratified random subset (seeded)
   max_clips: null
 

@@ -282,6 +282,7 @@ def discover_clips(
     seed: int = 42,
     validate: bool = True,
     exclude_weapons: Sequence[str] = ("epee",),
+    validate_mode: str = "exists",
 ) -> list[ClipRecord]:
     """
     Discover labelled clips for specified weapon(s).
@@ -299,10 +300,12 @@ def discover_clips(
         exclude_weapons: Weapons skipped when ``weapon`` is 'multi'/'all'.
         validate: Drop clips that are missing or cannot be decoded (see
             `filter_readable_clips`).
+        validate_mode: 'exists' | 'full' (`data.validate_clips`).
 
     Returns:
         List of ClipRecord.
     """
+    _check_validate_mode(validate_mode)
     per_dir: list[list[ClipRecord]] = []
     base_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -351,7 +354,7 @@ def discover_clips(
     if max_clips is not None and max_clips > 0:
         samples = stratified_subset(samples, max_clips, seed=seed)
     if validate:
-        samples = filter_readable_clips(samples)
+        samples = filter_readable_clips(samples, mode=validate_mode)
 
     log.info(
         f"Total discovered clips: {len(samples)} "
@@ -362,13 +365,47 @@ def discover_clips(
     return samples
 
 
-def filter_readable_clips(records: list[ClipRecord]) -> list[ClipRecord]:
+VALIDATE_MODES = ("exists", "full")
+
+
+def _check_validate_mode(mode: str) -> None:
+    if mode not in VALIDATE_MODES:
+        raise ValueError(
+            f"data.validate_clips must be one of {VALIDATE_MODES}, got {mode!r}"
+        )
+
+
+def _read_first_frame(path: str) -> None:
+    """Open a video and decode its first frame; raises if that fails."""
+    if DECORD_AVAILABLE:
+        vr = VideoReader(path, ctx=cpu(0))
+        if len(vr) <= 0:
+            raise RuntimeError("no frames")
+        vr[0].asnumpy()
+        return
+    import av
+
+    container = av.open(path)
+    try:
+        next(iter(container.decode(container.streams.video[0])))
+    except StopIteration:
+        raise RuntimeError("no frames") from None
+    finally:
+        container.close()
+
+
+def filter_readable_clips(
+    records: list[ClipRecord], mode: str = "exists"
+) -> list[ClipRecord]:
     """
     Drop clips that are missing or cannot be decoded; warn about each.
 
     Runs once at dataset build. Clips whose manifest provides `n_frames` are
-    only checked for existence; others are opened once to read the frame count.
+    only checked for existence in mode 'exists'; others are opened once to read
+    the frame count. Mode 'full' additionally opens every clip and decodes its
+    first frame, so corrupt files are found before training starts.
     """
+    _check_validate_mode(mode)
     valid: list[ClipRecord] = []
     dropped = 0
     for rec in records:
@@ -376,14 +413,16 @@ def filter_readable_clips(records: list[ClipRecord]) -> list[ClipRecord]:
         reason = None
         if not os.path.isfile(path):
             reason = "file not found"
-        elif rec.n_frames is None:
+        elif rec.n_frames is not None and rec.n_frames <= 0:
+            reason = "manifest n_frames <= 0"
+        elif rec.n_frames is None or mode == "full":
             try:
-                if _get_total_frames(path) <= 0:
+                if rec.n_frames is None and _get_total_frames(path) <= 0:
                     reason = "no frames"
+                elif mode == "full":
+                    _read_first_frame(path)
             except Exception as exc:  # decoder errors are backend specific
                 reason = f"unreadable ({exc})"
-        elif rec.n_frames <= 0:
-            reason = "manifest n_frames <= 0"
         if reason is None:
             valid.append(rec)
         else:
