@@ -247,6 +247,19 @@ def ambiguous_mask(
     )
 
 
+def ambiguous_macro_f1(
+    y_true: Sequence[int],
+    y_pred: Sequence[int],
+    hit_types: Sequence[str],
+    weapons: Sequence[str],
+) -> float:
+    """Macro-F1 on the ambiguous clips only; NaN if there are none."""
+    keep = ambiguous_mask(hit_types, weapons)
+    if not keep.any():
+        return float("nan")
+    return macro_f1(np.asarray(y_true)[keep], np.asarray(y_pred)[keep])
+
+
 def hybrid_predict(
     model_pred: Sequence[int], hit_types: Sequence[str], weapons: Sequence[str]
 ) -> tuple[NDArray[np.int64], NDArray[np.bool_]]:

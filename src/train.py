@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.inference import predict_with_flip_tta
-from src.metrics import macro_f1, per_class_recall
+from src.metrics import ambiguous_macro_f1, macro_f1, per_class_recall
 from src.seed import make_generator, seed_everything, seed_worker
 
 log = logging.getLogger(__name__)
@@ -50,7 +50,13 @@ def _setup_wandb(cfg: DictConfig) -> bool:
     return True
 
 
-SELECTION_METRICS = {"macro_f1": "val/macro_f1", "accuracy": "val/accuracy"}
+SELECTION_METRICS = {
+    "macro_f1": "val/macro_f1",
+    "accuracy": "val/accuracy",
+    # macro-F1 on the clips the lights do not decide (On-On, foil On-Off/Off-On)
+    "on_on_macro_f1": "val/on_on_macro_f1",
+}
+FALLBACK_SELECTION_METRIC = "macro_f1"
 
 
 def _selection_key(name: str) -> str:
@@ -61,6 +67,35 @@ def _selection_key(name: str) -> str:
             f"got {name!r}"
         )
     return SELECTION_METRICS[name]
+
+
+def _selection_score(
+    val_metrics: dict, name: str, warned: set
+) -> tuple[float, str]:
+    """Score for checkpoint selection and the metric name actually used.
+
+    ``on_on_macro_f1`` needs ambiguous clips in the validation split; without
+    them it falls back to ``macro_f1`` (warning logged once per run via
+    ``warned``).
+    """
+    key = _selection_key(name)
+    value = val_metrics.get(key)
+    if value is None or value != value:
+        if name not in warned:
+            warned.add(name)
+            log.warning(
+                f"selection_metric={name} is undefined (no ambiguous clips in the "
+                f"validation split); falling back to {FALLBACK_SELECTION_METRIC}"
+            )
+        name = FALLBACK_SELECTION_METRIC
+        value = val_metrics[_selection_key(name)]
+    return float(value), name
+
+
+def _clip_metadata(dataloader: DataLoader) -> dict:
+    """{abs clip path: (hit_type, weapon)} from the loader's dataset records."""
+    samples = getattr(dataloader.dataset, "samples", None) or []
+    return {rec.abs_path(): (rec.hit_type, rec.weapon) for rec in samples}
 
 
 def _build_scheduler(optimizer, cfg, steps_per_epoch: int):
@@ -249,6 +284,15 @@ def _validate(
         "val/accuracy": val_acc,
         "val/macro_f1": macro_f1(all_labels, all_preds),
     }
+    meta = _clip_metadata(dataloader)
+    if meta:
+        hit_types = [meta.get(p, ("", ""))[0] for p in all_paths]
+        weapon_names_by_clip = [meta.get(p, ("", ""))[1] for p in all_paths]
+        on_on_f1 = ambiguous_macro_f1(
+            all_labels, all_preds, hit_types, weapon_names_by_clip
+        )
+        if on_on_f1 == on_on_f1:  # omitted (not NaN) when no ambiguous clips
+            metrics["val/on_on_macro_f1"] = on_on_f1
     class_names = list(cfg.model.class_names)
     for name, rec in zip(class_names, per_class_recall(all_labels, all_preds)):
         if not np.isnan(rec):
@@ -533,7 +577,9 @@ def main(cfg: DictConfig):
     scheduler = _build_scheduler(optimizer, cfg, steps_per_epoch)
 
     # --- Training Loop ---
-    selection_key = _selection_key(cfg.training.selection_metric)
+    _selection_key(cfg.training.selection_metric)  # validate the name early
+    selection_warned: set = set()
+    selection_name = cfg.training.selection_metric
     best_score = -1.0
     best_val_acc = 0.0
     patience_counter = 0
@@ -577,11 +623,18 @@ def main(cfg: DictConfig):
             f"  Val   Loss: {val_metrics['val/loss']:.4f}  "
             f"Acc: {val_metrics['val/accuracy']:.4f}  "
             f"MacroF1: {val_metrics['val/macro_f1']:.4f}"
+            + (
+                f"  OnOnMacroF1: {val_metrics['val/on_on_macro_f1']:.4f}"
+                if "val/on_on_macro_f1" in val_metrics
+                else ""
+            )
         )
 
         # --- Checkpointing ---
         val_acc = val_metrics["val/accuracy"]
-        score = val_metrics[selection_key]
+        score, selection_name = _selection_score(
+            val_metrics, cfg.training.selection_metric, selection_warned
+        )
         if score > best_score:
             best_score = score
             best_val_acc = val_acc
@@ -594,13 +647,13 @@ def main(cfg: DictConfig):
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_accuracy": val_acc,
                     "val_macro_f1": val_metrics["val/macro_f1"],
-                    "selection_metric": cfg.training.selection_metric,
+                    "selection_metric": selection_name,
                     "config": OmegaConf.to_container(cfg, resolve=True),
                 },
                 ckpt_path,
             )
             log.info(
-                f"  ✓ New best model saved ({cfg.training.selection_metric}={score:.4f})"
+                f"  ✓ New best model saved ({selection_name}={score:.4f})"
             )
 
             # Save as W&B artifact
@@ -632,7 +685,7 @@ def main(cfg: DictConfig):
         ):
             log.info(
                 f"Early stopping triggered after {epoch + 1} epochs "
-                f"(best {cfg.training.selection_metric}={best_score:.4f})"
+                f"(best {selection_name}={best_score:.4f})"
             )
             break
 
@@ -646,7 +699,7 @@ def main(cfg: DictConfig):
         import wandb
 
         wandb.summary["best_val_accuracy"] = best_val_acc
-        wandb.summary[f"best_{cfg.training.selection_metric}"] = best_score
+        wandb.summary[f"best_{selection_name}"] = best_score
         wandb.finish()
 
     return best_val_acc

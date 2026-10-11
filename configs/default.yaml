@@ -124,8 +124,12 @@ model:
 training:
   # Seeds python, numpy, torch, DataLoader shuffling and workers
   seed: 42
-  # Metric for checkpoint selection / early stopping: macro_f1 | accuracy
-  selection_metric: "macro_f1"
+  # Metric for checkpoint selection / early stopping:
+  #   on_on_macro_f1 | macro_f1 | accuracy
+  # on_on_macro_f1 = macro-F1 on the clips the lights do not decide (On-On and
+  # foil On-Off/Off-On), so trivial single-light clips do not dominate the
+  # selection; falls back to macro_f1 (warning) if the val split has none.
+  selection_metric: "on_on_macro_f1"
 
   batch_size: 4
   epochs: 20
