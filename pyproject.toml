@@ -40,6 +40,12 @@ dev = [
     "hypothesis==6.169.0",
 ]
 
+[project.scripts]
+fencing-ai = "src.cli:main"
+
+[tool.setuptools]
+packages = ["src"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

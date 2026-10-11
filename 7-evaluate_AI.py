@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""
-7-evaluate_AI.py — Evaluate the trained Fencing Referee Model on Test Clips.
-
-Usage:
-    python 7-evaluate_AI.py
-    python 7-evaluate_AI.py eval.checkpoint=checkpoints/best_model.pt
-"""
+"""7-evaluate_AI.py - deprecated wrapper, use `python -m src evaluate`."""
 
 import sys
-import subprocess
+
+from src.cli import main
 
 if __name__ == "__main__":
-    cmd = [sys.executable, "-m", "src.evaluate"] + sys.argv[1:]
-    sys.exit(subprocess.run(cmd).returncode)
+    print("DEPRECATED: use 'python -m src evaluate' instead of 7-evaluate_AI.py.", file=sys.stderr)
+    sys.exit(main(["evaluate", *sys.argv[1:]]))
