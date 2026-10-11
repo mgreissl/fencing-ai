@@ -174,3 +174,18 @@ def test_build_model_reads_lora_dropout_default():
         for layer in model.backbone.modules()
         if isinstance(layer, LoraLayer)
     } == {0.05}
+def test_bilateral_pool_raises_on_mismatched_token_count_by_default():
+    config = VideoMAEConfig(image_size=32, patch_size=16)
+    with pytest.raises(ValueError, match="grid"):
+        bilateral_pool(torch.rand(1, 7, 4), config)
+
+
+def test_model_allow_pool_fallback_flag():
+    model = _tiny(allow_pool_fallback=True)
+    assert model.allow_pool_fallback is True
+    assert _tiny().allow_pool_fallback is False
+    # one frame less than the config expects: 1 temporal slot -> still fits;
+    # use a token count that cannot factor into the grid instead
+    config = VideoMAEConfig(image_size=32, patch_size=16)
+    pooled = bilateral_pool(torch.rand(1, 7, 4), config, allow_fallback=True)
+    assert torch.equal(pooled[:, 4:], torch.zeros(1, 4))

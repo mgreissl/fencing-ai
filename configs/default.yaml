@@ -76,6 +76,10 @@ model:
   # (no download; for smoke tests).
   backbone_config: null
 
+  # false: raise when the token count does not fit the VideoMAE grid; true:
+  # degrade to global pooling with a zero left-right difference (warning)
+  allow_pool_fallback: false
+
   # Freeze the backbone base
   freeze_backbone: true
 

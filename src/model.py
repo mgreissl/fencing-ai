@@ -118,7 +118,9 @@ class KinematicEncoder(nn.Module):
         return self.proj(feat)
 
 
-def bilateral_pool(sequence_output: torch.Tensor, config) -> torch.Tensor:
+def bilateral_pool(
+    sequence_output: torch.Tensor, config, allow_fallback: bool = False
+) -> torch.Tensor:
     """
     Pool VideoMAE tokens into [global mean, left-minus-right mean].
 
@@ -126,12 +128,14 @@ def bilateral_pool(sequence_output: torch.Tensor, config) -> torch.Tensor:
     height = width = image_size // patch_size; time = N // (height * width),
     which equals num_frames // tubelet_size for the configured clip length.
     The left half is the first width // 2 columns, the right half the rest.
-    If N does not factor into that grid, only the global mean is used and the
+    If N does not factor into that grid, a ValueError is raised; with
+    allow_fallback=True only the global mean is used (with a warning) and the
     difference half is zero.
 
     Args:
         sequence_output: (B, N, C) token features.
         config: VideoMAEConfig (image_size, patch_size).
+        allow_fallback: degrade to global mean + zeros instead of raising.
 
     Returns:
         (B, 2 * C) pooled features.
@@ -141,7 +145,13 @@ def bilateral_pool(sequence_output: torch.Tensor, config) -> torch.Tensor:
     grid_t, rest = divmod(N, side * side)
     z_global = sequence_output.mean(dim=1)
     if rest != 0 or grid_t == 0 or side < 2:
-        log.warning(f"Token count {N} does not fit a {side}x{side} grid; no bilateral pooling")
+        msg = f"Token count {N} does not fit a {side}x{side} grid"
+        if not allow_fallback:
+            raise ValueError(
+                f"{msg}; set model.allow_pool_fallback=true to fall back to "
+                "global pooling without the left-right difference"
+            )
+        log.warning(f"{msg}; no bilateral pooling")
         return torch.cat([z_global, torch.zeros_like(z_global)], dim=-1)
     grid = sequence_output.reshape(B, grid_t, side, side, C)
     half = side // 2
@@ -177,8 +187,10 @@ class FencingVideoMAE(nn.Module):
         kinematics_out_dim: int = 128,
         use_video: bool = True,
         backbone_config: Optional[dict] = None,
+        allow_pool_fallback: bool = False,
     ):
         super().__init__()
+        self.allow_pool_fallback = allow_pool_fallback
 
         if lora_layers is None:
             lora_layers = [8, 9, 10, 11]
@@ -332,7 +344,9 @@ class FencingVideoMAE(nn.Module):
             # VideoMAE expects (B, T, C, H, W); sequence output (B, N, hidden)
             outputs = self.backbone(pixel_values=pixel_values)
             sequence_output = self.fc_norm(outputs.last_hidden_state)
-            pooled = bilateral_pool(sequence_output, self.backbone_config)
+            pooled = bilateral_pool(
+                sequence_output, self.backbone_config, self.allow_pool_fallback
+            )
 
         # Add learned weapon conditioning if provided
         if pooled is not None and weapon_id is not None:
@@ -397,6 +411,7 @@ def build_model(cfg) -> FencingVideoMAE:
         kinematics_out_dim=kin_out,
         use_video=bool(getattr(cfg.model, "use_video", True)),
         backbone_config=backbone_config,
+        allow_pool_fallback=bool(getattr(cfg.model, "allow_pool_fallback", False)),
     )
     return model
 
