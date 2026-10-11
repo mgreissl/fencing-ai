@@ -195,3 +195,56 @@ def build_splits_for_test():
     from src.splits import build_splits
 
     return build_splits(_records(), seed=1)
+
+
+# --- group_by=tournament robustness (#57) ------------------------------------
+
+
+def test_tournament_grouping_without_any_tournament_raises_clear_error():
+    with pytest.raises(ValueError, match="tournament"):
+        make_group_splits(_records(with_tournament=False), group_by="tournament")
+
+
+def test_tournament_grouping_partial_missing_warns_and_falls_back_to_match(caplog):
+    import logging
+
+    recs = _records()
+    recs[0] = ClipRecord(
+        clip_path=recs[0].clip_path, label=recs[0].label, weapon="foil",
+        match_id=recs[0].match_id, tournament="",
+    )
+    with caplog.at_level(logging.WARNING, logger="src.splits"):
+        out = make_group_splits(recs, group_by="tournament")
+    assert any("without a tournament" in r.message for r in caplog.records)
+    assert_no_group_leak(out, "tournament")
+
+
+def test_tournament_grouping_too_few_tournaments_raises():
+    recs = [
+        ClipRecord(
+            clip_path=f"c{i}.mp4", label="LTR"[i % 3], weapon="foil",
+            match_id=f"m{i}", tournament="t0" if i < 20 else "t1",
+        )
+        for i in range(30)
+    ]
+    with pytest.raises(ValueError, match="tournaments"):
+        make_group_splits(recs, group_by="tournament")
+
+
+def test_kfold_tournament_without_tournament_raises():
+    with pytest.raises(ValueError, match="tournament"):
+        make_group_kfold_splits(
+            _records(with_tournament=False), 5, 0, group_by="tournament"
+        )
+
+
+def test_fencer_pair_grouping_is_rejected_with_explanation():
+    with pytest.raises(ValueError, match="fencer"):
+        make_group_splits(_records(), group_by="fencer_pair")
+
+
+def test_build_splits_tournament_default_group_by_unchanged():
+    from src.splits import build_splits
+
+    out = build_splits(_records(with_tournament=False))  # default: match
+    assert_no_group_leak(out, "match")

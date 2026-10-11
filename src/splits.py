@@ -25,8 +25,53 @@ def group_key(rec: ClipRecord, group_by: str = "match") -> str:
             return f"tournament:{rec.tournament}"
         return f"match:{rec.match_id}" if rec.match_id else f"clip:{rec.clip_path}"
     if group_by != "match":
-        raise ValueError(f"group_by must be 'match' or 'tournament', got {group_by!r}")
+        raise ValueError(_bad_group_by_message(group_by))
     return f"match:{rec.match_id}" if rec.match_id else f"clip:{rec.clip_path}"
+
+
+def _bad_group_by_message(group_by: str) -> str:
+    message = f"group_by must be 'match' or 'tournament', got {group_by!r}."
+    if "fencer" in str(group_by):
+        message += (
+            " Grouping by fencer pair is not supported: the manifest has no "
+            "fencer name columns."
+        )
+    return message
+
+
+def check_grouping(
+    records: Sequence[ClipRecord], group_by: str, n_bins: int = 3
+) -> None:
+    """Validate ``group_by`` against the data before splitting.
+
+    ``tournament`` needs the manifest's tournament field: raises if no clip has
+    one, warns when some lack it (those clips are grouped by match instead),
+    and raises if there are fewer tournaments than non-empty splits.
+    """
+    if group_by == "match":
+        return
+    if group_by != "tournament":
+        raise ValueError(_bad_group_by_message(group_by))
+    missing = sum(1 for rec in records if not rec.tournament)
+    if records and missing == len(records):
+        raise ValueError(
+            "group_by='tournament' needs a tournament for the clips, but none of "
+            f"the {len(records)} clips has one; re-run preprocessing or use "
+            "data.group_by=match"
+        )
+    if missing:
+        log.warning(
+            "%d of %d clips are without a tournament; they are grouped by match "
+            "instead, so the same tournament may still span splits",
+            missing,
+            len(records),
+        )
+    tournaments = {rec.tournament for rec in records if rec.tournament}
+    if len(tournaments) < n_bins:
+        raise ValueError(
+            f"group_by='tournament' found only {len(tournaments)} tournaments for "
+            f"{n_bins} splits; use data.group_by=match or add tournament metadata"
+        )
 
 
 def _group_counts(
@@ -96,6 +141,7 @@ def make_group_splits(
     """Return records with ``split`` filled in (train/val/test), grouped."""
     if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-6:
         raise ValueError("train/val/test ratios must sum to 1")
+    check_grouping(records, group_by, sum(r > 0 for r in (train_ratio, val_ratio, test_ratio)))
     assignment = assign_groups(
         records, [train_ratio, val_ratio, test_ratio], seed=seed, group_by=group_by
     )
@@ -119,6 +165,7 @@ def make_group_kfold_splits(
         raise ValueError("cv_folds must be >= 3 (train, val and test folds)")
     if not 0 <= fold < n_folds:
         raise ValueError(f"cv_fold must be in [0, {n_folds}), got {fold}")
+    check_grouping(records, group_by, n_folds)
     assignment = assign_groups(
         records, [1.0 / n_folds] * n_folds, seed=seed, group_by=group_by
     )

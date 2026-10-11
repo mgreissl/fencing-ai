@@ -36,7 +36,11 @@ data:
   # Random seed for reproducible splits (also seeds the max_clips subset)
   split_seed: 42
 
-  # Split grouping: clips of one 'match' (or 'tournament') never span splits
+  # Split grouping: clips of one 'match' (or 'tournament') never span splits.
+  # 'tournament' also keeps venue/camera/fencer priors out of the test split
+  # (report final numbers with it); it needs the manifest's tournament field and
+  # raises if absent. Grouping by fencer pair is not available (no fencer names
+  # in the manifest).
   group_by: "match"
   # Use the `split` column of the manifest if every row has one
   use_manifest_split: false
