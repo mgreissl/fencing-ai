@@ -778,6 +778,42 @@ def manifest_row(exchange, weapon, clip_path, match_id, source_url, tournament,
     }
 
 
+def clip_id(exchange, weapon, match_id, fps):
+    """Clip name stem ``{label}_{weapon}_{match_id}_{onset_ms}``.
+
+    Named by the onset time in the match, not by a running index, so that
+    re-processing a match gives the same name to the same exchange.
+    """
+    onset_ms = int(round(frame_to_seconds(exchange.onset_frame, fps) * 1000))
+    return f"{exchange.label}_{weapon}_{match_id}_{onset_ms}"
+
+
+def replace_manifest_rows(path, match_id, rows):
+    """Replace all manifest rows of ``match_id`` by ``rows`` (atomic rewrite).
+
+    A re-processed match must not keep rows of clips from an earlier run. Does
+    not create a manifest when there is nothing to write or to drop.
+    """
+    rows = list(rows)
+    path = os.fspath(path)
+    existing = []
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, newline="", encoding="utf-8") as fh:
+            existing = list(csv.DictReader(fh))
+    if not existing and not rows:
+        return
+    kept = [old for old in existing if old["match_id"] != match_id]
+    if len(kept) == len(existing) and not rows:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=MANIFEST_COLUMNS)
+        writer.writeheader()
+        writer.writerows(kept + rows)
+    os.replace(tmp_path, path)
+
+
 def append_manifest_rows(path, rows):
     """Append rows to the manifest (header once). Re-processed clips replace
     their earlier rows instead of duplicating them."""
@@ -867,8 +903,9 @@ def process_video_file(vid_path, output_dir, weapon="foil", cfg=None,
                        tournament="", manifest_path=None):
     """Cut and label exchanges from a single match video.
 
-    Saved clips are named ``{label}_{weapon}_{match_id}_{n}.mp4`` and described
-    in the manifest (default ``{output_dir}/manifest.csv``). Rejection reasons
+    Saved clips are named ``{label}_{weapon}_{match_id}_{onset_ms}.mp4`` and
+    described in the manifest (default ``{output_dir}/manifest.csv``); earlier
+    manifest rows of the same match are replaced. Rejection reasons
     are added to ``reason_counts`` (a Counter) and appended to the CSV at
     ``rejections_path`` when given.
     """
@@ -886,6 +923,7 @@ def process_video_file(vid_path, output_dir, weapon="foil", cfg=None,
         return saved
 
     def reject_video(reason):
+        replace_manifest_rows(manifest_path, vid_name, [])
         counts[reason] += 1
         if rejections_path:
             append_video_rejection(rejections_path, vid_name, weapon, reason)
@@ -905,15 +943,15 @@ def process_video_file(vid_path, output_dir, weapon="foil", cfg=None,
 
     jobs, job_exchanges = [], []
     for exchange in accepted_exchanges(exchanges):
-        clip_id = f"{exchange.label}_{weapon}_{vid_name}_{len(jobs)}"
-        jobs.append((exchange.window, os.path.join(output_dir, f"{clip_id}.mp4")))
+        name = clip_id(exchange, weapon, vid_name, timeline.fps)
+        jobs.append((exchange.window, os.path.join(output_dir, f"{name}.mp4")))
         job_exchanges.append(exchange)
     saved = write_clips(vid_path, jobs)
     for (_, path), exchange in zip(jobs, job_exchanges):
         if path not in saved:
             exchange.label, exchange.reason = None, "clip_write_incomplete"
 
-    append_manifest_rows(manifest_path, [
+    replace_manifest_rows(manifest_path, vid_name, [
         manifest_row(exchange, weapon, path, vid_name, source_url, tournament,
                      timeline.fps)
         for (_, path), exchange in zip(jobs, job_exchanges) if path in saved

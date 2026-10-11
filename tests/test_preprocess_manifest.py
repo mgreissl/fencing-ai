@@ -197,11 +197,11 @@ def test_process_video_file_writes_manifest_and_clip(tmp_path, monkeypatch):
     assert saved == 1
 
     (clip,) = [p for p in out_dir.iterdir() if p.suffix == ".mp4"]
-    assert clip.name == "L_sabre_abcDEF12345_0.mp4"
+    assert clip.name == "L_sabre_abcDEF12345_20000.mp4"  # onset 600 / 30 fps
 
     (entry,) = read_rows(out_dir / "manifest.csv")
     assert list(entry) == EXPECTED_COLUMNS
-    assert entry["clip_path"].endswith("L_sabre_abcDEF12345_0.mp4")
+    assert entry["clip_path"].endswith("L_sabre_abcDEF12345_20000.mp4")
     assert "\\" not in entry["clip_path"]
     assert entry["label"] == "L" and entry["weapon"] == "sabre"
     assert entry["match_id"] == "abcDEF12345"
@@ -216,6 +216,73 @@ def test_process_video_file_writes_manifest_and_clip(tmp_path, monkeypatch):
     assert entry["n_frames"] == "69"
     assert entry["light_frame_in_clip"] == "60"
     assert entry["split"] == ""
+
+
+def test_clip_name_uses_onset_time_not_running_index():
+    exchange = pp.Exchange(onset_frame=751, hit_type="On-No", label="R")
+    assert pp.clip_id(exchange, "foil", "m1", fps=25.0) == "R_foil_m1_30040"
+    other = pp.Exchange(onset_frame=900, hit_type="On-No", label="L")
+    assert pp.clip_id(other, "foil", "m1", fps=25.0) == "L_foil_m1_36000"
+
+
+def test_clip_name_parses_with_legacy_filename_parser():
+    from src.manifest import parse_legacy_filename
+
+    parsed = parse_legacy_filename("T_foil_abc-DEF_12345_30040.mp4")
+    assert parsed is not None and parsed["match_id"] == "abc-DEF_12345"
+
+
+def test_replace_manifest_rows_swaps_all_rows_of_a_match(tmp_path):
+    manifest = tmp_path / "manifest.csv"
+    pp.append_manifest_rows(manifest, [
+        row("a_0.mp4", match_id="A"), row("a_1.mp4", match_id="A"),
+        row("b_0.mp4", match_id="B"),
+    ])
+    pp.replace_manifest_rows(manifest, "A", [row("a_500.mp4", match_id="A")])
+    rows = read_rows(manifest)
+    assert sorted(r["clip_path"] for r in rows) == ["a_500.mp4", "b_0.mp4"]
+    assert list(rows[0]) == pp.MANIFEST_COLUMNS
+
+
+def test_replace_manifest_rows_with_no_rows_drops_the_match(tmp_path):
+    manifest = tmp_path / "manifest.csv"
+    pp.append_manifest_rows(manifest, [row("a_0.mp4", match_id="A"),
+                                       row("b_0.mp4", match_id="B")])
+    pp.replace_manifest_rows(manifest, "A", [])
+    assert [r["clip_path"] for r in read_rows(manifest)] == ["b_0.mp4"]
+
+
+def test_replace_manifest_rows_does_not_create_empty_manifest(tmp_path):
+    manifest = tmp_path / "manifest.csv"
+    pp.replace_manifest_rows(manifest, "A", [])
+    assert not manifest.exists()
+
+
+def test_reprocessing_replaces_rows_instead_of_duplicating(tmp_path, monkeypatch):
+    onset, change_at = 600, 620
+    monkeypatch.setattr(
+        pp, "check_score",
+        lambda frame: (3, 2) if decode_frame_index(frame) < change_at else (4, 2))
+    video = tmp_path / "abcDEF12345.avi"
+    write_synthetic_match(video, fps=30.0, n_frames=1500, onset=onset)
+    out_dir = tmp_path / "clips"
+    out_dir.mkdir()
+    manifest = out_dir / "manifest.csv"
+    pp.append_manifest_rows(manifest, [
+        row("data/clips/sabre/R_sabre_abcDEF12345_0.mp4", match_id="abcDEF12345",
+            label="R"),
+        row("data/clips/sabre/L_sabre_other_0.mp4", match_id="other"),
+    ])
+
+    for _ in range(2):
+        pp.process_video_file(
+            str(video), str(out_dir), "sabre",
+            cfg=pp.PipelineConfig(intro_s=2.0), min_video_s=1.0)
+
+    rows = read_rows(manifest)
+    mine = [r for r in rows if r["match_id"] == "abcDEF12345"]
+    assert len(mine) == 1 and mine[0]["clip_path"].endswith("_20000.mp4")
+    assert len(rows) == 2  # the other match is untouched
 
 
 def test_no_manifest_without_labelled_clips(tmp_path, monkeypatch):
