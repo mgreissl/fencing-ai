@@ -251,6 +251,20 @@ def build_splits(
     return out
 
 
+def resolve_checkpoint_dir(cfg) -> "Path":
+    """Checkpoint directory of a run; ``fold{k}`` is appended when CV is on.
+
+    Shared by training (writes) and evaluation (reads) so both agree.
+    """
+    from pathlib import Path
+
+    directory = Path(cfg.training.checkpoint_dir)
+    cv_folds = int(getattr(cfg.data, "cv_folds", 0) or 0)
+    if cv_folds > 0:
+        directory = directory / f"fold{int(getattr(cfg.data, 'cv_fold', 0) or 0)}"
+    return directory
+
+
 def save_split_manifest(records: Sequence[ClipRecord], directory) -> "Path":
     """Write the split assignment (manifest copy with `split` filled)."""
     from pathlib import Path

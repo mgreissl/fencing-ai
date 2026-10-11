@@ -165,3 +165,33 @@ def test_load_split_manifest_rejects_incomplete(tmp_path):
     write_manifest(_records(3), tmp_path / SPLIT_FILENAME)
     with pytest.raises(ValueError, match="split"):
         load_split_manifest(tmp_path)
+
+
+@pytest.mark.parametrize("cv_folds, expected", [(0, ""), (4, "fold2")])
+def test_resolve_checkpoint_dir_and_split_roundtrip(tmp_path, cv_folds, expected):
+    from omegaconf import OmegaConf
+
+    from src.splits import (
+        load_split_manifest,
+        resolve_checkpoint_dir,
+        save_split_manifest,
+    )
+
+    cfg = OmegaConf.create(
+        {
+            "training": {"checkpoint_dir": str(tmp_path)},
+            "data": {"cv_folds": cv_folds, "cv_fold": 2},
+        }
+    )
+    directory = resolve_checkpoint_dir(cfg)
+    assert directory == (tmp_path / expected if expected else tmp_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    recs = build_splits_for_test()
+    save_split_manifest(recs, directory)  # what training does
+    assert load_split_manifest(resolve_checkpoint_dir(cfg)) == recs  # evaluate
+
+
+def build_splits_for_test():
+    from src.splits import build_splits
+
+    return build_splits(_records(), seed=1)

@@ -420,7 +420,12 @@ def main(cfg: DictConfig):
 
     # --- Data ---
     from src.dataset import discover_clips, FencingVideoDataset, kinematics_dataset_kwargs
-    from src.splits import build_splits, save_split_manifest, select_split
+    from src.splits import (
+        build_splits,
+        resolve_checkpoint_dir,
+        save_split_manifest,
+        select_split,
+    )
     from src.transforms import build_train_transforms, build_eval_transforms
 
     samples = discover_clips(
@@ -457,9 +462,7 @@ def main(cfg: DictConfig):
     val_samples = select_split(split_records, "val")
 
     # Persist the split next to the checkpoint; evaluate.py reads it back.
-    checkpoint_dir = Path(cfg.training.checkpoint_dir)
-    if cv_folds > 0:
-        checkpoint_dir = checkpoint_dir / f"fold{cv_fold}"
+    checkpoint_dir = resolve_checkpoint_dir(cfg)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     save_split_manifest(split_records, checkpoint_dir)
 

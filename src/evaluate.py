@@ -349,11 +349,11 @@ def main(cfg: DictConfig):
         filter_readable_clips,
         kinematics_dataset_kwargs,
     )
-    from src.splits import load_split_manifest, select_split
+    from src.splits import load_split_manifest, resolve_checkpoint_dir, select_split
     from src.transforms import build_eval_transforms
 
     # --- Load Checkpoint ---
-    checkpoint_dir = Path(cfg.training.checkpoint_dir)
+    checkpoint_dir = resolve_checkpoint_dir(cfg)
     ckpt_path = checkpoint_dir / "best_model.pt"
     if not ckpt_path.exists():
         log.error(f"No checkpoint found at {ckpt_path}")
