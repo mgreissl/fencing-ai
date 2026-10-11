@@ -7,14 +7,18 @@ Processes match video URLs from {weapon}_videos.txt:
 2. Scans the video once: light state per frame, scoreboard digits at a stride.
 3. Auto-labels referee decision (L, R, T) from scoreboard digit OCR changes.
 4. Saves clips aligned to the light onset (PRE_S before to POST_S after, at
-   the source fps) into data/clips/{weapon}/.
+   the source fps) into data/clips/{weapon}/ and describes every clip in
+   data/clips/{weapon}/manifest.csv. Rejections go to
+   state/rejections_{weapon}.csv, progress to state/processed_{weapon}_urls.txt.
 5. Removes match video immediately to conserve disk space.
 """
 
 import argparse
 import csv
+import json
 import math
 import os
+import re
 import subprocess as sp
 import sys
 import time
@@ -664,16 +668,140 @@ def format_reason_counts(counts):
     )
 
 
+# ---------------------------------------------------------------------------
+# Manifest (one row per saved clip) and pipeline state files
+# ---------------------------------------------------------------------------
+
+MANIFEST_COLUMNS = [
+    "clip_path", "label", "weapon", "match_id", "source_url", "tournament",
+    "hit_type", "score_left_before", "score_right_before", "score_left_after",
+    "score_right_after", "light_time_s", "source_fps", "clip_fps", "n_frames",
+    "light_frame_in_clip", "split",
+]
+MANIFEST_NAME = "manifest.csv"
+
+LEGACY_STATE_DIR = os.path.join(BASE_DIR, "scripts")
+_YOUTUBE_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
+
+
+def parse_match_id(url):
+    """YouTube video id of a match URL (stable, filesystem-safe)."""
+    found = _YOUTUBE_ID.search(url or "")
+    if not found:
+        raise ValueError(f"Cannot parse a YouTube video id from {url!r}")
+    return found.group(1)
+
+
+def parse_tournament(title):
+    """Tournament name from the video title (whitespace-normalised, may be empty)."""
+    return re.sub(r"\s+", " ", re.sub(r"^\s*FE\s+", "", title or "")).strip()
+
+
+def repo_relative_posix(path):
+    """Path relative to the repo root with forward slashes (absolute if outside)."""
+    path = os.path.abspath(path)
+    try:
+        rel = os.path.relpath(path, BASE_DIR)
+    except ValueError:  # different drive
+        rel = None
+    if rel is None or rel.startswith(".."):
+        return path.replace(os.sep, "/")
+    return rel.replace(os.sep, "/")
+
+
+def manifest_row(exchange, weapon, clip_path, match_id, source_url, tournament,
+                 source_fps):
+    """Manifest row for one saved clip."""
+    window = exchange.window
+    return {
+        "clip_path": repo_relative_posix(clip_path),
+        "label": exchange.label,
+        "weapon": weapon,
+        "match_id": match_id,
+        "source_url": source_url,
+        "tournament": tournament,
+        "hit_type": exchange.hit_type,
+        "score_left_before": exchange.score_before[0],
+        "score_right_before": exchange.score_before[1],
+        "score_left_after": exchange.score_after[0],
+        "score_right_after": exchange.score_after[1],
+        "light_time_s": f"{frame_to_seconds(exchange.onset_frame, source_fps):.3f}",
+        "source_fps": f"{source_fps:g}",
+        "clip_fps": f"{window.clip_fps:g}",
+        "n_frames": window.n_frames,
+        "light_frame_in_clip": window.light_frame_in_clip,
+        "split": "",
+    }
+
+
+def append_manifest_rows(path, rows):
+    """Append rows to the manifest (header once). Re-processed clips replace
+    their earlier rows instead of duplicating them."""
+    rows = list(rows)
+    if not rows:
+        return
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    existing = []
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, newline="", encoding="utf-8") as fh:
+            existing = list(csv.DictReader(fh))
+
+    new_paths = {row["clip_path"] for row in rows}
+    if any(old["clip_path"] in new_paths for old in existing):
+        kept = [old for old in existing if old["clip_path"] not in new_paths]
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=MANIFEST_COLUMNS)
+            writer.writeheader()
+            writer.writerows(kept + rows)
+        os.replace(tmp_path, path)
+        return
+
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=MANIFEST_COLUMNS)
+        if not existing:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def _processed_log(weapon, directory):
+    return os.path.join(directory, f"processed_{weapon}_urls.txt")
+
+
+def load_processed_urls(weapon, state_dir=PIPELINE_STATE_DIR,
+                        legacy_dir=LEGACY_STATE_DIR):
+    """URLs already processed: state/ log plus the legacy scripts/ log if present."""
+    urls = set()
+    for directory in (state_dir, legacy_dir):
+        log = _processed_log(weapon, directory)
+        if os.path.exists(log):
+            with open(log, encoding="utf-8") as fh:
+                urls.update(line.strip() for line in fh if line.strip())
+    return urls
+
+
+def mark_processed(weapon, url, state_dir=PIPELINE_STATE_DIR):
+    """Record a URL as processed in state/processed_{weapon}_urls.txt."""
+    os.makedirs(state_dir, exist_ok=True)
+    with open(_processed_log(weapon, state_dir), "a", encoding="utf-8") as fh:
+        fh.write(url + "\n")
+
+
 def process_video_file(vid_path, output_dir, weapon="foil", cfg=None,
                        rejections_path=None, reason_counts=None,
-                       min_video_s=MIN_VIDEO_S):
+                       min_video_s=MIN_VIDEO_S, match_id=None, source_url="",
+                       tournament="", manifest_path=None):
     """Cut and label exchanges from a single match video.
 
-    Rejection reasons are added to ``reason_counts`` (a Counter) and appended
-    to the CSV at ``rejections_path`` when given.
+    Saved clips are named ``{label}_{weapon}_{match_id}_{n}.mp4`` and described
+    in the manifest (default ``{output_dir}/manifest.csv``). Rejection reasons
+    are added to ``reason_counts`` (a Counter) and appended to the CSV at
+    ``rejections_path`` when given.
     """
     cfg = cfg or PipelineConfig()
-    vid_name = os.path.splitext(os.path.basename(vid_path))[0]
+    vid_name = match_id or os.path.splitext(os.path.basename(vid_path))[0]
+    manifest_path = manifest_path or os.path.join(output_dir, MANIFEST_NAME)
     counts = Counter()
 
     def finish(saved):
@@ -712,12 +840,46 @@ def process_video_file(vid_path, output_dir, weapon="foil", cfg=None,
         if path not in saved:
             exchange.label, exchange.reason = None, "clip_write_incomplete"
 
+    append_manifest_rows(manifest_path, [
+        manifest_row(exchange, weapon, path, vid_name, source_url, tournament,
+                     timeline.fps)
+        for (_, path), exchange in zip(jobs, job_exchanges) if path in saved
+    ])
+
     counts.update(count_reasons(exchanges))
     if rejections_path:
         append_rejections(rejections_path, vid_name, weapon, exchanges, timeline.fps)
 
     print(f"  Successfully labelled {len(saved)} {weapon.upper()} clips.")
     return finish(len(saved))
+
+
+def download_match(url, match_id, precut_dir):
+    """Download a match in 360p; return (video_path, title) or (None, "")."""
+    cmd = [
+        "yt-dlp",
+        "--remote-components", "ejs:github",
+        "--cookies-from-browser", "firefox",
+        "--sleep-requests", "1.5",
+        "-f", "18/134/best[height<=360]",
+        "--no-warnings",
+        "--write-info-json",
+        "-o", os.path.join(precut_dir, "%(id)s.%(ext)s"),
+        url,
+    ]
+    if sp.run(cmd).returncode != 0:
+        return None, ""
+
+    title = ""
+    info_path = os.path.join(precut_dir, f"{match_id}.info.json")
+    if os.path.exists(info_path):
+        with open(info_path, encoding="utf-8") as fh:
+            title = json.load(fh).get("title", "")
+    for fname in sorted(os.listdir(precut_dir)):
+        stem, ext = os.path.splitext(fname)
+        if stem == match_id and ext in (".mp4", ".mkv", ".webm"):
+            return os.path.join(precut_dir, fname), title
+    return None, title
 
 
 def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
@@ -731,12 +893,7 @@ def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
     with open(urls_file) as f:
         all_urls = [line.strip() for line in f if line.strip().startswith("http")]
 
-    progress_log = os.path.join(BASE_DIR, "scripts", f"processed_{weapon}_urls.txt")
-    processed_urls = set()
-    if os.path.exists(progress_log):
-        with open(progress_log) as f:
-            processed_urls = set(line.strip() for line in f)
-
+    processed_urls = load_processed_urls(weapon)
     pending_urls = [u for u in all_urls if u not in processed_urls]
     if max_matches:
         pending_urls = pending_urls[:max_matches]
@@ -757,41 +914,35 @@ def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
 
     for idx, url in enumerate(pending_urls, 1):
         print(f"\n[{idx}/{len(pending_urls)}] Downloading & processing: {url}")
+        try:
+            match_id = parse_match_id(url)
+        except ValueError as e:
+            print(f"Skipping: {e}")
+            continue
+
         # Download in 360p via Firefox cookies + Deno JS challenge solver
-        cmd = [
-            "yt-dlp",
-            "--remote-components", "ejs:github",
-            "--cookies-from-browser", "firefox",
-            "--sleep-requests", "1.5",
-            "-f", "18/134/best[height<=360]",
-            "--no-warnings",
-            "-o", os.path.join(precut_dir, "%(title)s.%(ext)s"),
-            url
-        ]
-        res = sp.run(cmd)
-        if res.returncode != 0:
+        fpath, title = download_match(url, match_id, precut_dir)
+        if fpath is None:
             print(f"Failed to download {url}, skipping.")
             continue
 
-        # Process downloaded video
-        for fname in os.listdir(precut_dir):
-            if fname.endswith(".mp4"):
-                fpath = os.path.join(precut_dir, fname)
-                try:
-                    count = process_video_file(
-                        fpath, clips_dir, weapon=weapon, cfg=cfg,
-                        rejections_path=rejection_log, reason_counts=reason_counts,
-                    )
-                    total_new_clips += count
-                except Exception as e:
-                    print(f"Error processing {fname}: {e}")
-                finally:
-                    if os.path.exists(fpath):
-                        os.remove(fpath)
+        try:
+            count = process_video_file(
+                fpath, clips_dir, weapon=weapon, cfg=cfg,
+                rejections_path=rejection_log, reason_counts=reason_counts,
+                match_id=match_id, source_url=url,
+                tournament=parse_tournament(title),
+            )
+            total_new_clips += count
+        except Exception as e:
+            print(f"Error processing {match_id}: {e}")
+        finally:
+            for leftover in (fpath, os.path.join(precut_dir, f"{match_id}.info.json")):
+                if os.path.exists(leftover):
+                    os.remove(leftover)
 
         # Log URL as processed
-        with open(progress_log, "a") as f:
-            f.write(url + "\n")
+        mark_processed(weapon, url)
         processed_urls.add(url)
 
         # Gentle delay between matches to keep household network and YouTube happy
