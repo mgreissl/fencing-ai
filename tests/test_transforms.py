@@ -107,3 +107,20 @@ def test_builders_read_overlay_config():
     off = _overlay_cfg(enabled=False)
     assert build_train_transforms(off).overlay_mask_y_min_frac is None
     assert build_eval_transforms(off).overlay_mask_y_min_frac is None
+
+
+def test_flipped_masked_clip_has_no_overlay_pixels():
+    # overlay marker: bright red band in the bottom rows; scene is dark green
+    frames = torch.zeros(4, 3, 360, 640)
+    frames[:, 1] = 0.3
+    frames[:, 0, 300:330, 100:300] = 1.0
+    frames[:, 1:, 300:330, 100:300] = 0.0
+    transform = TrainVideoTransform(
+        frame_size=72, overlay_mask_y_min_frac=0.82, flip_prob=1.0, color_jitter=False
+    )
+    out, label = transform(frames, label=0)
+    assert label == 2  # flipped
+    band = out[:, :, int(72 * 0.82) + 1 :, :]
+    assert torch.allclose(band, torch.zeros_like(band), atol=1e-4)
+    # the scene itself is still present above the band
+    assert out[:, 1, :10, :].abs().min() > 0
