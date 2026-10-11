@@ -32,7 +32,7 @@ def run(tmp_path, monkeypatch):
     monkeypatch.setattr(pp, "PIPELINE_STATE_DIR", str(state))
     monkeypatch.setattr(pp, "download_match", fake_download)
     monkeypatch.setattr(pp, "process_video_file", fake_process)
-    monkeypatch.setattr(pp, "load_processed_urls", lambda weapon: set())
+    monkeypatch.setattr(pp, "load_processed_urls", lambda weapon, **kwargs: set())
     monkeypatch.setattr(pp, "mark_processed", lambda weapon, url: marked.append(url))
     monkeypatch.setattr(pp.time, "sleep", lambda s: None)
     pp.run_pipeline(weapon="foil")

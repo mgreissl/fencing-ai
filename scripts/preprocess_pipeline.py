@@ -9,7 +9,7 @@ Processes match video URLs from {weapon}_videos.txt:
 4. Saves clips aligned to the light onset (PRE_S before to POST_S after, at
    the source fps) into data/clips/{weapon}/ and describes every clip in
    data/clips/{weapon}/manifest.csv. Rejections go to
-   state/rejections_{weapon}.csv, progress to state/processed_{weapon}_urls.txt.
+   state/rejections_{weapon}.csv, progress to state/v2/processed_{weapon}_urls.txt.
 5. Removes match video immediately to conserve disk space.
 """
 
@@ -598,7 +598,11 @@ def write_clips(vid_path, jobs):
 # Rejection log: why was a candidate exchange not turned into a clip?
 # ---------------------------------------------------------------------------
 
-PIPELINE_STATE_DIR = os.path.join(BASE_DIR, "state")
+# Machine-local progress/failure/rejection logs. Versioned: a change of the
+# labelling or clip window bumps STATE_VERSION so that logs of an older
+# pipeline (state/*.txt, scripts/*.txt) never mark URLs as processed.
+STATE_VERSION = "v2"
+PIPELINE_STATE_DIR = os.path.join(BASE_DIR, "state", STATE_VERSION)
 REJECTION_COLUMNS = ["match_id", "weapon", "onset_frame", "light_time_s",
                      "hit_type", "reason"]
 
@@ -681,7 +685,8 @@ MANIFEST_COLUMNS = [
 ]
 MANIFEST_NAME = "manifest.csv"
 
-LEGACY_STATE_DIR = os.path.join(BASE_DIR, "scripts")
+LEGACY_STATE_DIRS = (os.path.join(BASE_DIR, "state"),
+                     os.path.join(BASE_DIR, "scripts"))
 _YOUTUBE_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
 
 
@@ -770,11 +775,19 @@ def _processed_log(weapon, directory):
     return os.path.join(directory, f"processed_{weapon}_urls.txt")
 
 
-def load_processed_urls(weapon, state_dir=PIPELINE_STATE_DIR,
-                        legacy_dir=LEGACY_STATE_DIR):
-    """URLs already processed: state/ log plus the legacy scripts/ log if present."""
+def load_processed_urls(weapon, state_dir=None, legacy_dirs=None,
+                        resume_legacy=False):
+    """URLs already processed by the current pipeline version.
+
+    Logs of the old pipeline (``LEGACY_STATE_DIRS``) are only read with
+    ``resume_legacy``; they were written with other labels and clip windows.
+    """
+    state_dir = state_dir or PIPELINE_STATE_DIR
+    directories = [state_dir]
+    if resume_legacy:
+        directories += LEGACY_STATE_DIRS if legacy_dirs is None else legacy_dirs
     urls = set()
-    for directory in (state_dir, legacy_dir):
+    for directory in directories:
         log = _processed_log(weapon, directory)
         if os.path.exists(log):
             with open(log, encoding="utf-8") as fh:
@@ -782,8 +795,9 @@ def load_processed_urls(weapon, state_dir=PIPELINE_STATE_DIR,
     return urls
 
 
-def mark_processed(weapon, url, state_dir=PIPELINE_STATE_DIR):
-    """Record a URL as processed in state/processed_{weapon}_urls.txt."""
+def mark_processed(weapon, url, state_dir=None):
+    """Record a URL as processed in state/v2/processed_{weapon}_urls.txt."""
+    state_dir = state_dir or PIPELINE_STATE_DIR
     os.makedirs(state_dir, exist_ok=True)
     with open(_processed_log(weapon, state_dir), "a", encoding="utf-8") as fh:
         fh.write(url + "\n")
@@ -967,7 +981,7 @@ def download_match(url, match_id, precut_dir, options=None):
 
 
 def run_pipeline(weapon="sabre", max_matches=None, cfg=None,
-                 download_options=None):
+                 download_options=None, resume_legacy=False):
     """Main pipeline execution loop."""
     cfg = cfg or PipelineConfig()
     download_options = download_options or DownloadOptions()
@@ -979,7 +993,7 @@ def run_pipeline(weapon="sabre", max_matches=None, cfg=None,
     with open(urls_file) as f:
         all_urls = [line.strip() for line in f if line.strip().startswith("http")]
 
-    processed_urls = load_processed_urls(weapon)
+    processed_urls = load_processed_urls(weapon, resume_legacy=resume_legacy)
     pending_urls = [u for u in all_urls if u not in processed_urls]
     if max_matches:
         pending_urls = pending_urls[:max_matches]
@@ -1064,6 +1078,10 @@ def add_cli_args(parser):
                         help="seconds kept after the light onset")
     parser.add_argument("--clip-fps", type=float, default=None,
                         help="fps of saved clips (default: native source fps)")
+    parser.add_argument("--resume-legacy", action="store_true",
+                        help="also skip URLs listed in the progress logs of the "
+                             "old pipeline (state/processed_*.txt, "
+                             "scripts/processed_*.txt); off by default")
     parser.add_argument("--cookies-browser", choices=COOKIE_BROWSERS,
                         default="none",
                         help="browser to read YouTube cookies from (default: none)")
@@ -1102,4 +1120,5 @@ if __name__ == "__main__":
     add_cli_args(parser)
     args = parser.parse_args()
     run_pipeline(args.weapon, args.max_matches, config_from_args(args),
-                 download_options_from_args(args))
+                 download_options_from_args(args),
+                 resume_legacy=args.resume_legacy)

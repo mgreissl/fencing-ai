@@ -90,25 +90,82 @@ def test_manifest_with_no_rows_creates_nothing(tmp_path):
     assert not manifest.exists()
 
 
-def test_processed_urls_union_of_state_and_legacy(tmp_path):
-    state = tmp_path / "state"
-    legacy = tmp_path / "scripts"
-    state.mkdir()
-    legacy.mkdir()
-    (state / "processed_foil_urls.txt").write_text("u1\nu2\n")
-    (legacy / "processed_foil_urls.txt").write_text("u2\nu3\n")
-    urls = pp.load_processed_urls("foil", state_dir=str(state), legacy_dir=str(legacy))
-    assert urls == {"u1", "u2", "u3"}
+def legacy_layout(tmp_path):
+    """New versioned log plus the two legacy locations (state/, scripts/)."""
+    new = tmp_path / "state" / "v2"
+    old_state = tmp_path / "state"
+    old_scripts = tmp_path / "scripts"
+    for directory in (new, old_scripts):
+        directory.mkdir(parents=True)
+    (new / "processed_foil_urls.txt").write_text("u1\nu2\n")
+    (old_state / "processed_foil_urls.txt").write_text("u2\nu3\n")
+    (old_scripts / "processed_foil_urls.txt").write_text("u4\n")
+    return str(new), (str(old_state), str(old_scripts))
 
 
-def test_processed_urls_legacy_only(tmp_path):
-    legacy = tmp_path / "scripts"
+def test_legacy_logs_ignored_by_default(tmp_path):
+    new, legacy = legacy_layout(tmp_path)
+    urls = pp.load_processed_urls("foil", state_dir=new, legacy_dirs=legacy)
+    assert urls == {"u1", "u2"}
+
+
+def test_resume_legacy_unions_all_logs(tmp_path):
+    new, legacy = legacy_layout(tmp_path)
+    urls = pp.load_processed_urls("foil", state_dir=new, legacy_dirs=legacy,
+                                  resume_legacy=True)
+    assert urls == {"u1", "u2", "u3", "u4"}
+
+
+def test_missing_logs_give_empty_set(tmp_path):
+    urls = pp.load_processed_urls("epee", state_dir=str(tmp_path / "x"),
+                                  legacy_dirs=(str(tmp_path / "y"),))
+    assert urls == set()
+
+
+def test_state_dir_is_versioned():
+    assert os.path.normpath(pp.PIPELINE_STATE_DIR) == os.path.normpath(
+        os.path.join(pp.BASE_DIR, "state", pp.STATE_VERSION))
+    assert pp.STATE_VERSION == "v2"
+    assert os.path.dirname(pp.rejections_path("foil")) == pp.PIPELINE_STATE_DIR
+    assert os.path.dirname(pp.failed_path("foil")) == pp.PIPELINE_STATE_DIR
+
+
+def test_default_state_dir_follows_module_setting(tmp_path, monkeypatch):
+    monkeypatch.setattr(pp, "PIPELINE_STATE_DIR", str(tmp_path / "v9"))
+    pp.mark_processed("foil", "u5")
+    assert pp.load_processed_urls("foil", legacy_dirs=()) == {"u5"}
+
+
+def test_resume_legacy_cli_flag():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    pp.add_cli_args(parser)
+    assert parser.parse_args([]).resume_legacy is False
+    assert parser.parse_args(["--resume-legacy"]).resume_legacy is True
+
+
+def test_pipeline_ignores_legacy_unless_asked(tmp_path, monkeypatch):
+    seen = []
+    (tmp_path / "foil_videos.txt").write_text(
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa\n"
+        "https://www.youtube.com/watch?v=bbbbbbbbbbb\n")
+    legacy = tmp_path / "state"
     legacy.mkdir()
-    (legacy / "processed_epee_urls.txt").write_text("u3\n")
-    urls = pp.load_processed_urls(
-        "epee", state_dir=str(tmp_path / "state"), legacy_dir=str(legacy)
-    )
-    assert urls == {"u3"}
+    (legacy / "processed_foil_urls.txt").write_text(
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa\n")
+    monkeypatch.setattr(pp, "BASE_DIR", str(tmp_path))
+    monkeypatch.setattr(pp, "PIPELINE_STATE_DIR", str(legacy / "v2"))
+    monkeypatch.setattr(pp, "LEGACY_STATE_DIRS", (str(legacy),))
+    monkeypatch.setattr(pp, "download_match",
+                        lambda url, *a: seen.append(url) or (None, ""))
+    monkeypatch.setattr(pp.time, "sleep", lambda s: None)
+
+    pp.run_pipeline(weapon="foil")
+    assert len(seen) == 2
+    seen.clear()
+    pp.run_pipeline(weapon="foil", resume_legacy=True)
+    assert seen == ["https://www.youtube.com/watch?v=bbbbbbbbbbb"]
 
 
 def test_mark_processed_writes_to_state_dir(tmp_path):

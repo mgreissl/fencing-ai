@@ -167,7 +167,7 @@ def test_pipeline_logs_download_error_into_failed_csv(tmp_path, monkeypatch,
     monkeypatch.setattr(pp, "BASE_DIR", str(tmp_path))
     monkeypatch.setattr(pp, "PIPELINE_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(pp, "download_match", failing_download)
-    monkeypatch.setattr(pp, "load_processed_urls", lambda weapon: set())
+    monkeypatch.setattr(pp, "load_processed_urls", lambda weapon, **kwargs: set())
     monkeypatch.setattr(pp.time, "sleep", lambda s: None)
     pp.run_pipeline(weapon="foil")
 
