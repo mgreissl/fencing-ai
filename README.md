@@ -33,6 +33,8 @@ This project expands upon work by Sholto Douglas in [SholtoD/fencing-AI](https:/
 
 ## 3. Experimental Evaluation
 
+> **Stale numbers.** The results and dataset counts below were measured with the old clip-level random split, where clips of the same match could land in train and test (leakage, #2), without confidence intervals, and before label, sampling and overlay-mask fixes. They are not comparable with the current pipeline and must be re-measured with the match-level split (`data.group_by=match` or grouped CV), then reported with bootstrap intervals (see "Statistical Evaluation").
+
 | Model Architecture | Adaptation Method | Test Accuracy | Peak Val Accuracy |
 | :--- | :--- | :---: | :---: |
 | **Fencing AI (2017)** | InceptionV3 + Rainbow Flow + LSTM | ~60.0% *(w/ leakage)* | — |
@@ -43,6 +45,8 @@ This project expands upon work by Sholto Douglas in [SholtoD/fencing-AI](https:/
 ---
 
 ## 4. Dataset Summary
+
+*Counts predate the manifest pipeline and the stricter label checks; regenerate them from `manifest.csv`.*
 
 Curated from 1,490 international tournament broadcasts (World Cups, Grand Prix, Olympic bouts):
 
