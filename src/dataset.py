@@ -2,7 +2,7 @@ import logging
 import os
 import random
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 import torch
@@ -253,6 +253,26 @@ WEAPON_MAP = {"foil": 0, "sabre": 1, "epee": 2}
 WEAPON_NAMES = ["Foil", "Sabre", "Epee"]
 
 
+ALL_WEAPONS = ("foil", "sabre", "epee")
+
+
+def resolve_weapons(weapon: str, exclude_weapons: Sequence[str] = ("epee",)) -> list[str]:
+    """
+    Weapons to load for a ``data.weapon`` setting.
+
+    'multi'/'all' expand to foil, sabre, epee minus ``exclude_weapons`` (epee has
+    no right of way, so its label follows from the lights and adds noise to a
+    shared model). A single weapon name is returned as is, never excluded.
+    """
+    if weapon.lower() not in ("multi", "all"):
+        return [weapon.lower()]
+    excluded = {w.lower() for w in exclude_weapons or ()}
+    weapons = [w for w in ALL_WEAPONS if w not in excluded]
+    if not weapons:
+        raise ValueError(f"exclude_weapons={sorted(excluded)} leaves no weapon to load")
+    return weapons
+
+
 def discover_clips(
     clips_dir: Optional[str] = None,
     weapon: str = "foil",
@@ -261,6 +281,7 @@ def discover_clips(
     max_clips: Optional[int] = None,
     seed: int = 42,
     validate: bool = True,
+    exclude_weapons: Sequence[str] = ("epee",),
 ) -> list[ClipRecord]:
     """
     Discover labelled clips for specified weapon(s).
@@ -275,6 +296,7 @@ def discover_clips(
         flipped_dir: Optional legacy directory containing pre-flipped clips.
         max_clips: Size of a label-stratified random subset (None/0 = all).
         seed: Seed for the max_clips subset.
+        exclude_weapons: Weapons skipped when ``weapon`` is 'multi'/'all'.
         validate: Drop clips that are missing or cannot be decoded (see
             `filter_readable_clips`).
 
@@ -284,7 +306,7 @@ def discover_clips(
     per_dir: list[list[ClipRecord]] = []
     base_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    weapons_to_load = ["foil", "sabre", "epee"] if weapon in ["multi", "all"] else [weapon.lower()]
+    weapons_to_load = resolve_weapons(weapon, exclude_weapons)
 
     for w in weapons_to_load:
         target_dirs = []

@@ -7,6 +7,9 @@
 data:
   # Target weapon mode: 'foil' | 'sabre' | 'epee' | 'multi'
   weapon: "${oc.env:FENCING_WEAPON,foil}"
+  # Weapons left out when weapon is 'multi'/'all' (epee has no right of way,
+  # its label follows from the lights; ignored for a single-weapon run)
+  exclude_weapons: [epee]
   # Path to directory containing .mp4 clips with filename prefix labels (L/R/T)
   clips_dir: "${oc.env:FENCING_CLIPS_DIR,data/clips/foil}"
   # Legacy static flipped directory (false by default: on-the-fly dynamic flip is used)

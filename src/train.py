@@ -425,6 +425,7 @@ def main(cfg: DictConfig):
         flipped_dir=getattr(cfg.data, "flipped_dir", None),
         max_clips=getattr(cfg.data, "max_clips", None),
         seed=cfg.data.split_seed,
+        exclude_weapons=list(getattr(cfg.data, "exclude_weapons", ["epee"])),
     )
 
     if len(samples) == 0:
