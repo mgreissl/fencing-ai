@@ -90,7 +90,8 @@ def check_score(frame):
 #   priority (On-Off +1 left -> L). If the score stays unchanged the referee
 #   gave priority to the off-target fencer (On-Off -> R, Off-On -> L).
 #
-# Epee has no priority; both touches count. The label is who was hit:
+# Epee has no priority; both touches count. The label is the fencer who scored
+# (the one whose score went up), not the one who was hit:
 #   L / R  single light and that fencer's score went up by one.
 #   T      both lights and both scores went up by one (double touch).
 #
