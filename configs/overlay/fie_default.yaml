@@ -41,6 +41,8 @@ lights:
 score:
   left: [309, 325, 265, 285]
   right: [309, 325, 355, 375]
+  # Digit reads whose class probability is below this are rejected.
+  min_confidence: 0.9
 
 # Harvest-time overlay probe (dark header bar and unlit light boxes).
 probe:
@@ -48,3 +50,10 @@ probe:
   header_max_mean: 100
   # Unlit light regions must be darker than this mean pixel value.
   unlit_max_mean: 115
+
+# Digit classifier (scoreboard numbers 0-15). The npz holds the multinomial
+# logistic regression coefficients and is independent of the scikit-learn
+# version; the pickle is only a fallback.
+classifier:
+  npz: resources/logistic_classifier_0-15.npz
+  pickle: resources/logistic_classifier_0-15.pkl

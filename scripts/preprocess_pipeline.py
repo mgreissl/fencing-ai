@@ -12,7 +12,6 @@ Processes match video URLs from {weapon}_videos.txt:
 
 import argparse
 import os
-import pickle
 import sys
 import cv2
 import subprocess as sp
@@ -28,13 +27,8 @@ from src import overlay  # noqa: E402
 # Overlay geometry/thresholds: single source of truth in configs/overlay/.
 OVERLAY = overlay.load_overlay(overlay.DEFAULT_OVERLAY)
 
-RESOURCES_DIR = os.path.join(BASE_DIR, "resources")
-
-# Load logistic regression digit classifier (trained for scoreboard numbers 0-15)
-CLASSIFIER_PATH = os.path.join(RESOURCES_DIR, "logistic_classifier_0-15.pkl")
-with open(CLASSIFIER_PATH, "rb") as fd:
-    SCORE_MODEL = pickle.load(fd)
-SCORE_MODEL.classes_ = np.arange(16)
+# Digit classifier (npz, pickle fallback) for scoreboard numbers 0-15.
+SCORE_CLASSIFIER = overlay.load_digit_classifier(cfg=OVERLAY)
 
 FFMPEG_BIN = "ffmpeg"
 FPS = 13
@@ -48,11 +42,9 @@ def check_lights(frame, weapon="foil"):
 
 
 def check_score(frame):
-    """Predict left and right fencer scores from scoreboard crops."""
-    left_crop, right_crop = overlay.score_crops(frame, OVERLAY)
-    left_score = int(SCORE_MODEL.predict(left_crop)[0])
-    right_score = int(SCORE_MODEL.predict(right_crop)[0])
-    return left_score, right_score
+    """Return (left, right) scores, or None if a digit read is not confident."""
+    read = overlay.read_score(frame, OVERLAY, SCORE_CLASSIFIER)
+    return None if read is None else (read.left, read.right)
 
 
 def determine_label(hit_type, left, right, next_left, next_right, weapon="foil"):
@@ -184,14 +176,11 @@ def process_video_file(vid_path, output_dir, weapon="foil"):
             continue
 
         # Score before touch (frames 20..40)
-        try:
-            left_1, right_1 = check_score(c_frames[25])
-            left_2, right_2 = check_score(c_frames[35])
-        except Exception:
+        before_1 = check_score(c_frames[25])
+        before_2 = check_score(c_frames[35])
+        if before_1 is None or before_1 != before_2:
             continue
-
-        if left_1 != left_2 or right_1 != right_2:
-            continue
+        left_1, right_1 = before_1
 
         left_score, right_score = left_1, right_1
 
@@ -199,16 +188,12 @@ def process_video_file(vid_path, output_dir, weapon="foil"):
         if len(c_frames) < 130:
             continue
 
-        try:
-            n_left_1, n_right_1 = check_score(c_frames[120])
-            n_left_2, n_right_2 = check_score(c_frames[125])
-        except Exception:
+        after_1 = check_score(c_frames[120])
+        after_2 = check_score(c_frames[125])
+        if after_1 is None or after_1 != after_2:
             continue
 
-        if n_left_1 != n_left_2 or n_right_1 != n_right_2:
-            continue
-
-        next_left, next_right = n_left_1, n_right_1
+        next_left, next_right = after_1
 
         # Determine label
         label = determine_label(hit_type, left_score, right_score, next_left, next_right, weapon=weapon)

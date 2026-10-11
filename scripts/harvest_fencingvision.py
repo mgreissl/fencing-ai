@@ -21,7 +21,6 @@ Usage:
 import argparse
 import json
 import os
-import pickle
 import re
 import subprocess as sp
 import sys
@@ -39,11 +38,8 @@ from src import overlay  # noqa: E402
 # Overlay geometry/thresholds: single source of truth in configs/overlay/.
 OVERLAY = overlay.load_overlay(overlay.DEFAULT_OVERLAY)
 
-RESOURCES_DIR = os.path.join(BASE_DIR, "resources")
-CLASSIFIER_PATH = os.path.join(RESOURCES_DIR, "logistic_classifier_0-15.pkl")
-with open(CLASSIFIER_PATH, "rb") as fd:
-    SCORE_MODEL = pickle.load(fd)
-SCORE_MODEL.classes_ = np.arange(16)
+# Digit classifier (npz, pickle fallback) for scoreboard numbers 0-15.
+SCORE_CLASSIFIER = overlay.load_digit_classifier(cfg=OVERLAY)
 
 
 def parse_weapon(title):
@@ -112,12 +108,11 @@ def check_video_overlay(url):
         if not overlay_ok:
             return False, overlay_reason
 
-        # 3. Score crops validity
-        l_crop, r_crop = overlay.score_crops(frame, OVERLAY)
-        s_l = int(SCORE_MODEL.predict(l_crop)[0])
-        s_r = int(SCORE_MODEL.predict(r_crop)[0])
-        if not (0 <= s_l <= 15 and 0 <= s_r <= 15):
-            return False, f"Invalid scores ({s_l}, {s_r})"
+        # 3. Score crops validity (confident digit reads)
+        score = overlay.read_score(frame, OVERLAY, SCORE_CLASSIFIER)
+        if score is None:
+            return False, "Score digits unreadable (low confidence)"
+        s_l, s_r = score.left, score.right
 
         return True, f"Valid overlay ({overlay_reason}, scores={s_l}-{s_r})"
     except sp.TimeoutExpired:

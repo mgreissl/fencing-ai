@@ -8,10 +8,12 @@ all go through it.
 
 from __future__ import annotations
 
+import logging
+import pickle
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
+from typing import NamedTuple, Sequence
 
 import cv2
 import numpy as np
@@ -21,6 +23,8 @@ from numpy.typing import NDArray
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OVERLAY_CONFIG_DIR = REPO_ROOT / "configs" / "overlay"
 DEFAULT_OVERLAY = "fie_default"
+
+logger = logging.getLogger(__name__)
 
 Region = tuple[int, int, int, int]  # (y0, y1, x0, x1), half-open
 
@@ -50,6 +54,9 @@ class OverlayConfig:
     header_region: Region
     header_max_mean: float
     unlit_max_mean: float
+    min_score_confidence: float
+    classifier_npz: Path
+    classifier_pickle: Path
     raw: dict
 
 
@@ -102,6 +109,9 @@ def load_overlay(name_or_path: str | Path = DEFAULT_OVERLAY) -> OverlayConfig:
         header_region=_region(probe["header_region"]),
         header_max_mean=float(probe["header_max_mean"]),
         unlit_max_mean=float(probe["unlit_max_mean"]),
+        min_score_confidence=float(raw["score"]["min_confidence"]),
+        classifier_npz=REPO_ROOT / raw["classifier"]["npz"],
+        classifier_pickle=REPO_ROOT / raw["classifier"]["pickle"],
         raw=raw,
     )
 
@@ -207,3 +217,100 @@ def probe_frame(frame: NDArray[np.uint8], cfg: OverlayConfig) -> tuple[bool, str
         return False, f"Light regions too bright ({light_l:.1f}, {light_r:.1f})"
 
     return True, f"header={header_mean:.1f}"
+
+
+class DigitClassifier:
+    """Multinomial logistic regression over flattened scoreboard digit crops.
+
+    Holds plain numpy coefficients, so it does not depend on the scikit-learn
+    version that trained the model.
+    """
+
+    def __init__(
+        self,
+        coef: NDArray[np.float64],
+        intercept: NDArray[np.float64],
+        classes: NDArray[np.int64],
+    ) -> None:
+        self.coef = np.asarray(coef, dtype=np.float64)
+        self.intercept = np.asarray(intercept, dtype=np.float64)
+        self.classes = np.asarray(classes)
+
+    def predict_proba(self, x: NDArray) -> NDArray[np.float64]:
+        """Class probabilities, shape (n_samples, n_classes)."""
+        logits = np.asarray(x, dtype=np.float64) @ self.coef.T + self.intercept
+        logits -= logits.max(axis=1, keepdims=True)  # stable softmax
+        expo = np.exp(logits)
+        return expo / expo.sum(axis=1, keepdims=True)
+
+    def predict(self, x: NDArray) -> NDArray:
+        """Most likely class per sample."""
+        return self.classes[self.predict_proba(x).argmax(axis=1)]
+
+    def save_npz(self, path: str | Path) -> None:
+        np.savez(path, coef=self.coef, intercept=self.intercept, classes=self.classes)
+
+    @classmethod
+    def load_npz(cls, path: str | Path) -> "DigitClassifier":
+        with np.load(path) as data:
+            return cls(data["coef"], data["intercept"], data["classes"])
+
+
+def load_pickled_classifier(path: str | Path) -> DigitClassifier:
+    """Load the legacy scikit-learn pickle and copy out its coefficients.
+
+    Isolated here because pickles are tied to the scikit-learn version. The
+    pickled model lacks ``classes_``; the labels are the digits 0-15.
+    """
+    with open(path, "rb") as fh:
+        model = pickle.load(fh)  # noqa: S301 - trusted repo resource
+    n_classes = model.coef_.shape[0]
+    return DigitClassifier(model.coef_, model.intercept_, np.arange(n_classes))
+
+
+def export_classifier_npz(pickle_path: str | Path, npz_path: str | Path) -> None:
+    """Convert the legacy pickle into the version-independent npz format."""
+    load_pickled_classifier(pickle_path).save_npz(npz_path)
+
+
+def load_digit_classifier(
+    npz_path: str | Path | None = None,
+    pickle_path: str | Path | None = None,
+    cfg: OverlayConfig | None = None,
+) -> DigitClassifier:
+    """Load the digit classifier from npz, falling back to the pickle."""
+    cfg = cfg or load_overlay(DEFAULT_OVERLAY)
+    npz_path = Path(npz_path or cfg.classifier_npz)
+    pickle_path = Path(pickle_path or cfg.classifier_pickle)
+    if npz_path.exists():
+        return DigitClassifier.load_npz(npz_path)
+    if pickle_path.exists():
+        logger.warning("%s missing, falling back to pickle %s", npz_path, pickle_path)
+        return load_pickled_classifier(pickle_path)
+    raise FileNotFoundError(f"No digit classifier found ({npz_path}, {pickle_path})")
+
+
+class ScoreRead(NamedTuple):
+    """A confident reading of the scoreboard."""
+
+    left: int
+    right: int
+    confidence: float  # lower of the two digit probabilities
+
+
+def read_score(
+    frame: NDArray[np.uint8],
+    cfg: OverlayConfig,
+    classifier: DigitClassifier,
+    min_confidence: float | None = None,
+) -> ScoreRead | None:
+    """Read both scores; None if either digit is below the confidence threshold."""
+    threshold = cfg.min_score_confidence if min_confidence is None else min_confidence
+    left_crop, right_crop = score_crops(frame, cfg)
+    proba = classifier.predict_proba(np.vstack([left_crop, right_crop]))
+    best = proba.argmax(axis=1)
+    confidence = float(proba[np.arange(2), best].min())
+    if confidence < threshold:
+        return None
+    classes = getattr(classifier, "classes", np.arange(proba.shape[1]))
+    return ScoreRead(int(classes[best[0]]), int(classes[best[1]]), confidence)
