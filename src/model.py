@@ -212,11 +212,18 @@ class FencingVideoMAE(nn.Module):
         Args:
             pixel_values: Tensor of shape (B, T, C, H, W) — batch of video clips.
             weapon_id: Optional tensor of shape (B,) with weapon integers (0=Foil, 1=Sabre, 2=Epee).
-            kinematics: Optional tensor of shape (B, T, D_kin) with kinematic time-series.
+            kinematics: Tensor of shape (B, T, D_kin) with kinematic time-series;
+                required when the model was built with use_kinematics=True.
 
         Returns:
             Logits tensor of shape (B, num_classes).
         """
+        if self.use_kinematics and kinematics is None:
+            raise ValueError(
+                "Model was built with use_kinematics=True but no kinematics were "
+                "passed; check that the dataset yields a 'kinematics' tensor."
+            )
+
         # VideoMAE expects (B, T, C, H, W)
         outputs = self.backbone(pixel_values=pixel_values)
 
@@ -242,12 +249,7 @@ class FencingVideoMAE(nn.Module):
 
         # Fuse kinematic features if enabled
         if self.use_kinematics:
-            if kinematics is not None:
-                kin_feat = self.kinematic_encoder(kinematics)
-            else:
-                kin_feat = torch.zeros(
-                    pooled.size(0), self.kinematics_dim, device=pooled.device, dtype=pooled.dtype
-                )
+            kin_feat = self.kinematic_encoder(kinematics)
             pooled = torch.cat([pooled, kin_feat], dim=-1)
 
         # Classification logits
