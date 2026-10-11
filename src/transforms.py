@@ -118,16 +118,10 @@ class TrainVideoTransform:
 
                 kinematics = flip_kinematic_features(kinematics)
 
-        # --- Color Jitter (same params for all frames) ---
+        # --- Color Jitter (v2 samples one parameter set per call, so the whole
+        # (T, C, H, W) clip gets identical jitter without touching global RNG) ---
         if self.color_jitter_transform is not None:
-            # Use a fixed seed to ensure the same random jitter across all frames
-            seed = random.randint(0, 2**32 - 1)
-            jittered = []
-            for f in frames:
-                torch.manual_seed(seed)
-                random.seed(seed)
-                jittered.append(self.color_jitter_transform(f))
-            frames = torch.stack(jittered)
+            frames = self.color_jitter_transform(frames)
 
         # --- Random Grayscale ---
         if self.grayscale_prob > 0 and random.random() < self.grayscale_prob:
