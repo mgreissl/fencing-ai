@@ -19,7 +19,6 @@ def build_train_transforms(cfg) -> "TrainVideoTransform":
     """Build training-time augmentation pipeline from Hydra config."""
     return TrainVideoTransform(
         frame_size=cfg.data.frame_size,
-        crop_scale=tuple(cfg.augmentation.train.random_resized_crop.scale),
         flip_prob=cfg.augmentation.train.horizontal_flip.prob
         if cfg.augmentation.train.horizontal_flip.enabled
         else 0.0,
@@ -43,7 +42,7 @@ class TrainVideoTransform:
     """
     Training augmentations applied consistently across all frames of a clip.
 
-    The same random parameters (crop region, flip decision, color jitter params)
+    The same random parameters (flip decision, color jitter params)
     are applied to every frame so that temporal coherence is preserved.
 
     Horizontal flipping also swaps Left↔Right labels (fencing is symmetric).
@@ -52,7 +51,6 @@ class TrainVideoTransform:
     def __init__(
         self,
         frame_size: int = 224,
-        crop_scale: tuple = (0.8, 1.0),
         flip_prob: float = 0.5,
         color_jitter: bool = True,
         brightness: float = 0.2,
@@ -62,7 +60,6 @@ class TrainVideoTransform:
         grayscale_prob: float = 0.0,
     ):
         self.frame_size = frame_size
-        self.crop_scale = crop_scale
         self.flip_prob = flip_prob
         self.grayscale_prob = grayscale_prob
 

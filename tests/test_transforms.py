@@ -46,3 +46,14 @@ def test_color_jitter_does_not_reseed_global_rng(monkeypatch):
     monkeypatch.setattr(torch, "manual_seed", fail)
     monkeypatch.setattr(random, "seed", fail)
     transform(_clip(), label=0)
+
+
+def test_build_from_default_config_has_no_dead_crop_settings():
+    from omegaconf import OmegaConf
+
+    from src.transforms import build_train_transforms
+
+    cfg = OmegaConf.load("configs/default.yaml")
+    assert "random_resized_crop" not in cfg.augmentation.train
+    transform = build_train_transforms(cfg)
+    assert not hasattr(transform, "crop_scale")

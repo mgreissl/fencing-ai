@@ -140,9 +140,6 @@ eval:
 augmentation:
   # Training augmentations
   train:
-    random_resized_crop:
-      enabled: true
-      scale: [0.8, 1.0]
     horizontal_flip:
       enabled: true
       prob: 0.5
