@@ -23,6 +23,15 @@ data:
     enabled: true
     y_min_frac: null
 
+  # Crop the piste band (full width, rows y_min_frac * H .. y_max_frac * H)
+  # before resize, flip and masking, so the model input is not spent on the
+  # sky and the scoreboard (default OFF; evaluate against the full frame).
+  # y_max_frac null = overlay top (see overlay_mask above).
+  piste_crop:
+    enabled: false
+    y_min_frac: 0.25
+    y_max_frac: null
+
   # Number of frames to sample per clip (must match model expectation)
   num_frames: 16
   # Spatial resolution fed to the model

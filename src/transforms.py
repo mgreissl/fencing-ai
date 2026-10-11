@@ -51,6 +51,61 @@ def mask_overlay(
     return out
 
 
+def crop_piste(
+    frames: torch.Tensor, y_min_frac: float, y_max_frac: Optional[float] = None
+) -> torch.Tensor:
+    """
+    Crop the horizontal piste band out of every frame.
+
+    Keeps rows ``int(H * y_min_frac)`` to ``int(H * y_max_frac)`` (None = the
+    bottom), full width. Apply to raw frames before resize and flip: the band
+    then fills the model input instead of spending tokens on the sky and the
+    scoreboard.
+
+    Args:
+        frames: Tensor (..., C, H, W).
+        y_min_frac: First kept row as a fraction of the frame height.
+        y_max_frac: End (exclusive) of the band as a fraction, or None.
+
+    Returns:
+        A view of the cropped frames.
+    """
+    height = frames.shape[-2]
+    top = int(height * y_min_frac)
+    bottom = height if y_max_frac is None else int(height * y_max_frac)
+    if not 0 <= top < bottom <= height:
+        raise ValueError(
+            f"data.piste_crop selects rows [{top}, {bottom}) of {height}; "
+            "need 0 <= y_min_frac < y_max_frac <= 1"
+        )
+    return frames[..., top:bottom, :]
+
+
+def _piste_crop_band(cfg) -> Optional[tuple]:
+    """(y_min_frac, y_max_frac) if ``data.piste_crop`` is enabled, else None.
+
+    A null ``y_max_frac`` means the overlay top: ``data.overlay_mask.y_min_frac``
+    if set, else derived from the overlay geometry.
+    """
+    crop = OmegaConf.select(cfg, "data.piste_crop")
+    if crop is None or not crop.get("enabled", False):
+        return None
+    y_min = float(crop.get("y_min_frac", 0.25))
+    y_max = crop.get("y_max_frac")
+    if y_max is None:
+        mask = OmegaConf.select(cfg, "data.overlay_mask")
+        override = mask.get("y_min_frac") if mask is not None else None
+        if override is not None:
+            y_max = float(override)
+        else:
+            from src.overlay import overlay_mask_y_min_frac
+
+            y_max = overlay_mask_y_min_frac(
+                mask.get("overlay") if mask is not None else None
+            )
+    return (y_min, float(y_max))
+
+
 def _overlay_mask_frac(cfg) -> Optional[float]:
     """Mask start fraction if the mask is enabled, else None.
 
@@ -74,6 +129,7 @@ def build_train_transforms(cfg) -> "TrainVideoTransform":
     return TrainVideoTransform(
         frame_size=cfg.data.frame_size,
         overlay_mask_y_min_frac=_overlay_mask_frac(cfg),
+        piste_crop=_piste_crop_band(cfg),
         random_affine=cfg.augmentation.train.random_affine.enabled,
         affine_translate=tuple(cfg.augmentation.train.random_affine.translate),
         affine_scale=tuple(cfg.augmentation.train.random_affine.scale),
@@ -99,6 +155,7 @@ def build_eval_transforms(cfg) -> "EvalVideoTransform":
     return EvalVideoTransform(
         frame_size=cfg.data.frame_size,
         overlay_mask_y_min_frac=_overlay_mask_frac(cfg),
+        piste_crop=_piste_crop_band(cfg),
     )
 
 
@@ -116,6 +173,7 @@ class TrainVideoTransform:
         self,
         frame_size: int = 224,
         overlay_mask_y_min_frac: Optional[float] = None,
+        piste_crop: Optional[tuple] = None,
         flip_prob: float = 0.5,
         random_affine: bool = False,
         affine_translate: tuple = (0.05, 0.05),
@@ -132,6 +190,7 @@ class TrainVideoTransform:
     ):
         self.frame_size = frame_size
         self.overlay_mask_y_min_frac = overlay_mask_y_min_frac
+        self.piste_crop = piste_crop
         self.flip_prob = flip_prob
         self.grayscale_prob = grayscale_prob
 
@@ -192,6 +251,10 @@ class TrainVideoTransform:
         if self.overlay_mask_y_min_frac is not None:
             frames = mask_overlay(frames, self.overlay_mask_y_min_frac)
 
+        # --- Optional piste crop (before resize, so the band fills the input) ---
+        if self.piste_crop is not None:
+            frames = crop_piste(frames, *self.piste_crop)
+
         # --- Direct Resize (preserves both fencers and entire piste) ---
         frames = torch.stack([self.resize(f) for f in frames])
 
@@ -243,9 +306,11 @@ class EvalVideoTransform:
         self,
         frame_size: int = 224,
         overlay_mask_y_min_frac: Optional[float] = None,
+        piste_crop: Optional[tuple] = None,
     ):
         self.frame_size = frame_size
         self.overlay_mask_y_min_frac = overlay_mask_y_min_frac
+        self.piste_crop = piste_crop
         self.transform = T.Compose(
             [
                 T.Resize(
@@ -275,6 +340,8 @@ class EvalVideoTransform:
         """
         if self.overlay_mask_y_min_frac is not None:
             frames = mask_overlay(frames, self.overlay_mask_y_min_frac)
+        if self.piste_crop is not None:
+            frames = crop_piste(frames, *self.piste_crop)
         frames = torch.stack([self.transform(f) for f in frames])
         if kinematics is not None:
             return frames, label, kinematics
