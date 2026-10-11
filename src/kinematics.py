@@ -17,9 +17,12 @@ frame indices the video stream samples. See ``KINEMATIC_FEATURE_NAMES``.
 Also provides broadcast-style AR velocity glow rendering (Olympic "Fencing Visualized" style).
 """
 
+import contextlib
 import hashlib
 import json
 import os
+import tempfile
+import time
 import cv2
 import numpy as np
 import torch
@@ -134,6 +137,77 @@ def kinematics_cache_path(
     cfg = resolve_kinematics_settings(settings)
     tag = f"v{KINEMATIC_FEATURE_VERSION}_{Path(cfg['pose_model']).stem}_{kinematics_settings_hash(cfg)}"
     return Path(cache_dir) / tag / f"{Path(clip_path).stem}.npy"
+
+
+def save_kinematics_atomic(path: Union[str, os.PathLike], array: np.ndarray) -> Path:
+    """
+    Write ``array`` to ``path`` (.npy) so that readers never see a partial file.
+
+    The data goes to a temporary file in the same directory, is flushed to disk
+    and then moved over the target with ``os.replace`` (atomic on POSIX and
+    Windows). On failure the temporary file is removed and an existing target
+    is left untouched. If several DataLoader workers race, the last complete
+    write wins.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            np.save(fh, np.asarray(array))
+            fh.flush()
+            os.fsync(fh.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(tmp_name, path)
+                break
+            except PermissionError:
+                # Windows refuses to replace a file another process has open.
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+    return path
+
+
+def load_or_compute_kinematics(
+    clip_path: Union[str, os.PathLike],
+    cache_dir: Union[str, os.PathLike],
+    settings: Optional[dict] = None,
+    pose_model=None,
+    compute_if_missing: bool = True,
+) -> np.ndarray:
+    """
+    Return the full-rate (T_clip, KINEMATIC_FEATURE_DIM) features of a clip.
+
+    Loads ``kinematics_cache_path(cache_dir, clip_path, settings)`` if it holds a
+    readable array with the current layout; otherwise computes the features on
+    all frames of the clip and stores them with ``save_kinematics_atomic``.
+    Select the sampled frames afterwards with ``select_kinematic_frames``, so
+    the cache is independent of sampling mode and temporal jitter.
+
+    Args:
+        compute_if_missing: if False, raise ``FileNotFoundError`` instead of
+            running pose estimation (e.g. inside DataLoader workers).
+    """
+    path = kinematics_cache_path(cache_dir, clip_path, settings)
+    if path.exists():
+        try:
+            feats = np.load(path, allow_pickle=False)
+            if feats.ndim == 2 and feats.shape[1] == KINEMATIC_FEATURE_DIM:
+                return feats.astype(np.float32, copy=False)
+        except (OSError, ValueError, EOFError):
+            pass  # corrupt or truncated file: recompute below
+    if not compute_if_missing:
+        raise FileNotFoundError(
+            f"No kinematics cache at {path}; run scripts/precompute_kinematics.py first."
+        )
+    feats = extract_kinematic_features(clip_path, pose_model=pose_model, settings=settings)
+    save_kinematics_atomic(path, feats)
+    return feats
 
 
 def get_pose_model(model_name: str = "yolo11n-pose.pt"):

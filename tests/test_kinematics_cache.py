@@ -70,3 +70,93 @@ def test_get_pose_model_caches_per_name(monkeypatch):
     assert a.name == "a-pose.pt" and b.name == "b-pose.pt"
     assert kin.get_pose_model("a-pose.pt") is a
     assert created == ["a-pose.pt", "b-pose.pt"]
+
+
+# --- atomic writes and load-or-compute (#35) -------------------------------
+
+
+def _tmp_leftovers(directory: Path) -> list[Path]:
+    return [p for p in directory.iterdir() if p.suffix == ".tmp"]
+
+
+def test_save_atomic_roundtrip(tmp_path):
+    target = tmp_path / "sub" / "clip.npy"
+    arr = np.arange(42, dtype=np.float32).reshape(2, 21)
+    assert kin.save_kinematics_atomic(target, arr) == target
+    np.testing.assert_array_equal(np.load(target), arr)
+    assert _tmp_leftovers(target.parent) == []
+
+
+def test_failed_save_leaves_no_partial_file(tmp_path, monkeypatch):
+    target = tmp_path / "clip.npy"
+
+    def broken_save(fh, arr, *args, **kwargs):
+        fh.write(b"\x93NUMPY partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(kin.np, "save", broken_save)
+    with pytest.raises(OSError):
+        kin.save_kinematics_atomic(target, np.zeros((3, 21)))
+    assert not target.exists()
+    assert _tmp_leftovers(tmp_path) == []
+
+
+def test_failed_save_keeps_previous_file_intact(tmp_path, monkeypatch):
+    target = tmp_path / "clip.npy"
+    old = np.ones((4, 21), dtype=np.float32)
+    kin.save_kinematics_atomic(target, old)
+
+    def broken_save(fh, arr, *args, **kwargs):
+        fh.write(b"garbage")
+        raise RuntimeError("killed")
+
+    monkeypatch.setattr(kin.np, "save", broken_save)
+    with pytest.raises(RuntimeError):
+        kin.save_kinematics_atomic(target, np.zeros((4, 21)))
+    monkeypatch.undo()
+    np.testing.assert_array_equal(np.load(target), old)
+
+
+@pytest.fixture
+def fake_extract(monkeypatch):
+    calls = []
+
+    def extract(clip_path, pose_model=None, fps=None, settings=None):
+        calls.append(str(clip_path))
+        return np.full((7, kin.KINEMATIC_FEATURE_DIM), len(calls), dtype=np.float32)
+
+    monkeypatch.setattr(kin, "extract_kinematic_features", extract)
+    return calls
+
+
+def test_load_or_compute_computes_once_then_loads(tmp_path, fake_extract):
+    first = kin.load_or_compute_kinematics("clips/L1.mp4", tmp_path)
+    second = kin.load_or_compute_kinematics("clips/L1.mp4", tmp_path)
+    assert fake_extract == ["clips/L1.mp4"]
+    np.testing.assert_array_equal(first, second)
+    assert second.shape == (7, kin.KINEMATIC_FEATURE_DIM)
+    assert kinematics_cache_path(tmp_path, "clips/L1.mp4").exists()
+
+
+def test_load_or_compute_recomputes_for_new_settings(tmp_path, fake_extract):
+    kin.load_or_compute_kinematics("L1.mp4", tmp_path)
+    kin.load_or_compute_kinematics("L1.mp4", tmp_path, settings={"max_gap": 1})
+    assert len(fake_extract) == 2
+
+
+def test_load_or_compute_can_require_precomputed_cache(tmp_path, fake_extract):
+    with pytest.raises(FileNotFoundError):
+        kin.load_or_compute_kinematics("L1.mp4", tmp_path, compute_if_missing=False)
+    assert fake_extract == []
+
+
+def test_load_or_compute_replaces_corrupt_or_stale_file(tmp_path, fake_extract):
+    path = kinematics_cache_path(tmp_path, "L1.mp4")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\x93NUMPY truncated")
+    feats = kin.load_or_compute_kinematics("L1.mp4", tmp_path)
+    assert feats.shape == (7, kin.KINEMATIC_FEATURE_DIM)
+    np.save(path, np.zeros((5, 16), dtype=np.float32))  # old 16-dim layout
+    feats = kin.load_or_compute_kinematics("L1.mp4", tmp_path)
+    assert feats.shape[1] == kin.KINEMATIC_FEATURE_DIM
+    assert len(fake_extract) == 2
