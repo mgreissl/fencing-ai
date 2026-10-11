@@ -1,9 +1,11 @@
 import src.compat  # noqa: F401 — must be first to patch Hydra for Python 3.14+
 
+import json
 import logging
 import os
 import sys
 from pathlib import Path
+from typing import Sequence
 
 import hydra
 import numpy as np
@@ -17,6 +19,8 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+from src.metrics import LABEL_LETTERS, evaluation_report, write_predictions
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +119,16 @@ def log_results_to_wandb(
     # --- Summary Metrics ---
     wandb.summary["test/accuracy"] = results["accuracy"]
     wandb.summary["test/loss"] = results["loss"]
+    extra = results.get("report_extra")
+    if extra is not None:
+        wandb.summary["test/macro_f1"] = extra["overall"]["macro_f1"]
+        wandb.summary["test/ece"] = extra["overall"]["ece"]
+        wandb.summary["test/baseline_majority_accuracy"] = extra["baselines"]["majority"]["accuracy"]
+        wandb.summary["test/baseline_light_only_accuracy"] = extra["baselines"]["light_only"]["accuracy"]
+        for hit, m in extra["per_hit_type"].items():
+            wandb.summary[f"test/hit_type/{hit}/accuracy"] = m["accuracy"]
+        for weapon, m in extra["per_weapon"].items():
+            wandb.summary[f"test/weapon/{weapon}/accuracy"] = m["accuracy"]
 
     # Per-class metrics
     for cls_name in class_names:
@@ -217,6 +231,103 @@ def _extract_thumbnail(path: str) -> "Image.Image":
     return extract_thumbnail(path)
 
 
+def merge_checkpoint_config(
+    base_cfg: DictConfig, checkpoint_cfg: dict, overrides: Sequence[str] = ()
+) -> DictConfig:
+    """Config used for evaluation: checkpoint settings win over defaults.
+
+    Precedence (low to high): current defaults (fills keys that older
+    checkpoints lack) < config stored in the checkpoint < explicit CLI
+    overrides (``key=value`` strings; ``~``-deletions and ``hydra.*`` skipped).
+    """
+    explicit = []
+    for item in overrides:
+        item = item.strip()
+        if not item or item.startswith("~") or "=" not in item:
+            continue
+        item = item.lstrip("+")
+        if item.startswith("hydra."):
+            continue
+        explicit.append(item)
+    merged = OmegaConf.merge(
+        base_cfg, OmegaConf.create(checkpoint_cfg), OmegaConf.from_dotlist(explicit)
+    )
+    OmegaConf.resolve(merged)
+    return merged
+
+
+def _cli_overrides() -> list[str]:
+    """Explicit command-line overrides of this Hydra run."""
+    from hydra.core.hydra_config import HydraConfig
+
+    return list(HydraConfig.get().overrides.task)
+
+
+def _to_jsonable(obj):
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _to_jsonable(obj.tolist())
+    if isinstance(obj, (np.floating, float)):
+        value = float(obj)
+        return None if value != value else value  # NaN -> null
+    if isinstance(obj, np.integer):
+        return int(obj)
+    return obj
+
+
+def prediction_rows(records: Sequence, results: dict) -> list[dict]:
+    """Per-clip rows for predictions.csv (records are in dataloader order)."""
+    rows = []
+    for rec, label, pred, probs in zip(
+        records, results["all_labels"], results["all_preds"], results["all_probs"]
+    ):
+        rows.append(
+            {
+                "clip_path": rec.clip_path,
+                "match_id": rec.match_id,
+                "hit_type": rec.hit_type,
+                "weapon": rec.weapon,
+                "label": LABEL_LETTERS[label],
+                "pred": LABEL_LETTERS[pred],
+                "p_L": f"{probs[0]:.6f}",
+                "p_T": f"{probs[1]:.6f}",
+                "p_R": f"{probs[2]:.6f}",
+            }
+        )
+    return rows
+
+
+def _log_report(report: dict) -> None:
+    overall = report["overall"]
+    log.info(
+        f"Overall: acc={overall['accuracy']:.4f} macro_f1={overall['macro_f1']:.4f} "
+        f"ECE={overall['ece']:.4f} recall(L/T/R)="
+        + "/".join("n/a" if r != r else f"{r:.3f}" for r in overall["recall"])
+    )
+    log.info("Per hit type:")
+    for name, m in report["per_hit_type"].items():
+        log.info(f"  {name:<8} n={m['n']:<4} acc={m['accuracy']:.4f} macro_f1={m['macro_f1']:.4f}")
+    if report["on_on"] is not None:
+        log.info(f"On-On accuracy: {report['on_on']['accuracy']:.4f} (n={report['on_on']['n']})")
+    log.info("Per weapon:")
+    for name, m in report["per_weapon"].items():
+        log.info(f"  {name:<6} n={m['n']:<4} acc={m['accuracy']:.4f} macro_f1={m['macro_f1']:.4f}")
+    base = report["baselines"]
+    log.info(
+        f"Baseline majority ({base['majority']['predicts']}): "
+        f"acc={base['majority']['accuracy']:.4f} macro_f1={base['majority']['macro_f1']:.4f}"
+    )
+    light = base["light_only"]
+    on_on = light["on_on_accuracy"]
+    log.info(
+        f"Baseline light-only: acc={light['accuracy']:.4f} macro_f1={light['macro_f1']:.4f}"
+        + ("" if on_on is None else f" on_on_acc={on_on:.4f}")
+    )
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="default")
 def main(cfg: DictConfig):
     """Main evaluation entry point."""
@@ -225,20 +336,31 @@ def main(cfg: DictConfig):
     log.info("=" * 60)
 
     from src.model import get_device, build_model
-    from src.dataset import discover_clips, make_splits, FencingVideoDataset
+    from src.dataset import FencingVideoDataset, filter_readable_clips
+    from src.splits import load_split_manifest, select_split
     from src.transforms import build_eval_transforms
 
-    device = get_device(cfg.training.device)
-    log.info(f"Using device: {device}")
-
     # --- Load Checkpoint ---
-    ckpt_path = Path(cfg.training.checkpoint_dir) / "best_model.pt"
+    checkpoint_dir = Path(cfg.training.checkpoint_dir)
+    ckpt_path = checkpoint_dir / "best_model.pt"
     if not ckpt_path.exists():
         log.error(f"No checkpoint found at {ckpt_path}")
         sys.exit(1)
 
+    # Split assignment saved by training; never recomputed here.
+    split_records = load_split_manifest(checkpoint_dir)
+
+    # Model and data settings come from the checkpoint; CLI overrides only
+    # where given explicitly.
     log.info(f"Loading checkpoint: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "config" not in checkpoint:
+        log.error("Checkpoint has no stored config; cannot rebuild the model")
+        sys.exit(1)
+    cfg = merge_checkpoint_config(cfg, checkpoint["config"], _cli_overrides())
+
+    device = get_device(cfg.training.device)
+    log.info(f"Using device: {device}")
 
     model = build_model(cfg)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -249,31 +371,23 @@ def main(cfg: DictConfig):
     )
 
     # --- Data ---
-    samples = discover_clips(
-        clips_dir=getattr(cfg.data, "clips_dir", None),
-        weapon=getattr(cfg.data, "weapon", "foil"),
-        include_flipped=getattr(cfg.data, "include_flipped", False),
-        flipped_dir=getattr(cfg.data, "flipped_dir", None),
-        max_clips=getattr(cfg.data, "max_clips", None),
-    )
-
-    _, _, test_samples = make_splits(
-        samples,
-        train_ratio=cfg.data.train_ratio,
-        val_ratio=cfg.data.val_ratio,
-        test_ratio=cfg.data.test_ratio,
-        seed=cfg.data.split_seed,
-    )
+    eval_split = cfg.eval.split
+    test_samples = filter_readable_clips(select_split(split_records, eval_split))
+    train_samples = select_split(split_records, "train")
+    if not test_samples:
+        log.error(f"No readable clips in split '{eval_split}'")
+        sys.exit(1)
 
     eval_transform = build_eval_transforms(cfg)
-    sampling_mode = getattr(cfg.data, "sampling_mode", "end_weighted")
     use_kinematics = getattr(cfg.model, "use_kinematics", False)
     test_dataset = FencingVideoDataset(
         samples=test_samples,
         num_frames=cfg.data.num_frames,
         transform=eval_transform,
-        sampling_mode=sampling_mode,
+        sampling_mode=cfg.data.sampling_mode,
         use_kinematics=use_kinematics,
+        window_pre_s=cfg.data.window_pre_s,
+        window_post_s=cfg.data.window_post_s,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -286,41 +400,41 @@ def main(cfg: DictConfig):
     class_names = list(cfg.model.class_names)
 
     # --- Evaluate ---
-    log.info(f"Evaluating on {len(test_dataset)} test clips...")
+    log.info(f"Evaluating on {len(test_dataset)} '{eval_split}' clips...")
     results = evaluate(model, test_loader, device, class_names)
 
     # --- Print Results ---
     log.info(f"\n{'=' * 40}")
-    log.info(f"TEST ACCURACY: {results['accuracy']:.4f} ({results['accuracy'] * 100:.1f}%)")
-    log.info(f"TEST LOSS:     {results['loss']:.4f}")
+    log.info(f"{eval_split.upper()} ACCURACY: {results['accuracy']:.4f} ({results['accuracy'] * 100:.1f}%)")
+    log.info(f"{eval_split.upper()} LOSS:     {results['loss']:.4f}")
     log.info(f"{'=' * 40}")
     log.info(f"\nClassification Report:\n{results['report_str']}")
     log.info(f"\nConfusion Matrix:\n{results['confusion_matrix']}")
 
-    weapon_names = {0: "Foil", 1: "Sabre", 2: "Epee"}
-    weapon_correct = {0: 0, 1: 0, 2: 0}
-    weapon_total = {0: 0, 1: 0, 2: 0}
-    for t, p, w in zip(results["all_labels"], results["all_preds"], results["all_weapons"]):
-        weapon_total[w] += 1
-        if t == p:
-            weapon_correct[w] += 1
-
-    log.info("\nPer-Weapon Test Accuracy:")
-    for w_id, w_name in weapon_names.items():
-        if weapon_total[w_id] > 0:
-            w_acc = weapon_correct[w_id] / weapon_total[w_id]
-            log.info(f"  {w_name:<6}: {w_acc:.4f} ({w_acc * 100:.1f}%) [{weapon_correct[w_id]}/{weapon_total[w_id]}]")
-
-    # Count misclassified
-    n_misclassified = sum(
-        1
-        for t, p in zip(results["all_labels"], results["all_preds"])
-        if t != p
+    report = evaluation_report(
+        y_true=results["all_labels"],
+        y_pred=results["all_preds"],
+        probs=np.asarray(results["all_probs"]),
+        hit_types=[r.hit_type for r in test_samples],
+        weapons=[r.weapon for r in test_samples],
+        train_labels=[r.label_id for r in train_samples],
+        train_hit_types=[r.hit_type for r in train_samples],
+        ece_bins=cfg.eval.ece_bins,
     )
-    log.info(
-        f"\nMisclassified: {n_misclassified}/{len(results['all_labels'])} "
-        f"({100 * n_misclassified / max(len(results['all_labels']), 1):.1f}%)"
+    results["report_extra"] = report
+    _log_report(report)
+
+    # --- Save per-clip predictions + metrics ---
+    out_dir = Path(cfg.eval.output_dir) if cfg.eval.output_dir else checkpoint_dir
+    write_predictions(
+        prediction_rows(test_samples, results), out_dir / f"predictions_{eval_split}.csv"
     )
+    metrics_path = out_dir / f"metrics_{eval_split}.json"
+    metrics_path.write_text(
+        json.dumps(_to_jsonable({"loss": results["loss"], **report}), indent=2),
+        encoding="utf-8",
+    )
+    log.info(f"Saved predictions and metrics to {out_dir}")
 
     # --- Log to W&B ---
     if cfg.wandb.enabled:
