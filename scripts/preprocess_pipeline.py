@@ -12,11 +12,13 @@ Processes match video URLs from {weapon}_videos.txt:
 """
 
 import argparse
+import csv
 import math
 import os
 import subprocess as sp
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 import cv2
@@ -587,28 +589,135 @@ def write_clips(vid_path, jobs):
             if n == window.n_frames]
 
 
-def process_video_file(vid_path, output_dir, weapon="foil", cfg=None):
-    """Cut and label exchanges from a single match video."""
+# ---------------------------------------------------------------------------
+# Rejection log: why was a candidate exchange not turned into a clip?
+# ---------------------------------------------------------------------------
+
+PIPELINE_STATE_DIR = os.path.join(BASE_DIR, "state")
+REJECTION_COLUMNS = ["match_id", "weapon", "onset_frame", "light_time_s",
+                     "hit_type", "reason"]
+
+
+def rejections_path(weapon):
+    """Per-weapon rejection log: state/rejections_{weapon}.csv."""
+    return os.path.join(PIPELINE_STATE_DIR, f"rejections_{weapon}.csv")
+
+
+def count_reasons(exchanges):
+    """Counter of rejection reasons; accepted exchanges count as ``accepted``."""
+    return Counter("accepted" if e.accepted else e.reason for e in exchanges)
+
+
+def _append_rows(path, rows):
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=REJECTION_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def append_rejections(path, match_id, weapon, exchanges, fps):
+    """Append one row per rejected exchange (header written once)."""
+    rows = [
+        {
+            "match_id": match_id,
+            "weapon": weapon,
+            "onset_frame": e.onset_frame,
+            "light_time_s": f"{frame_to_seconds(e.onset_frame, fps):.3f}",
+            "hit_type": e.hit_type,
+            "reason": e.reason,
+        }
+        for e in exchanges
+        if not e.accepted
+    ]
+    if rows:
+        _append_rows(path, rows)
+
+
+def append_video_rejection(path, match_id, weapon, reason):
+    """Append a row for a whole video that produced no candidates."""
+    _append_rows(path, [{"match_id": match_id, "weapon": weapon, "onset_frame": "",
+                         "light_time_s": "", "hit_type": "", "reason": reason}])
+
+
+def read_reason_counts(path):
+    """Counter of reasons over a rejection log (empty if it does not exist)."""
+    counts = Counter()
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as fh:
+            counts.update(row["reason"] for row in csv.DictReader(fh))
+    return counts
+
+
+def format_reason_counts(counts):
+    """Readable lines, rejection reasons first (most frequent on top)."""
+    total = sum(counts.values()) or 1
+    ordered = sorted(
+        counts.items(), key=lambda kv: (kv[0] == "accepted", -kv[1], kv[0])
+    )
+    return "\n".join(
+        f"    {reason:<32s}{n:>6d}  ({100.0 * n / total:4.1f}%)"
+        for reason, n in ordered
+    )
+
+
+def process_video_file(vid_path, output_dir, weapon="foil", cfg=None,
+                       rejections_path=None, reason_counts=None,
+                       min_video_s=MIN_VIDEO_S):
+    """Cut and label exchanges from a single match video.
+
+    Rejection reasons are added to ``reason_counts`` (a Counter) and appended
+    to the CSV at ``rejections_path`` when given.
+    """
     cfg = cfg or PipelineConfig()
     vid_name = os.path.splitext(os.path.basename(vid_path))[0]
+    counts = Counter()
+
+    def finish(saved):
+        if reason_counts is not None:
+            reason_counts.update(counts)
+        if counts:
+            print("  Outcome per candidate exchange:")
+            print(format_reason_counts(counts))
+        return saved
+
+    def reject_video(reason):
+        counts[reason] += 1
+        if rejections_path:
+            append_video_rejection(rejections_path, vid_name, weapon, reason)
+        return finish(0)
 
     timeline = scan_video(vid_path, weapon, cfg)
     if timeline is None:
         print(f"Video {vid_name} has no valid fps, skipping.")
-        return 0
-    if timeline.n_frames < seconds_to_frames(MIN_VIDEO_S, timeline.fps):
+        return reject_video("invalid_source_fps")
+    if timeline.n_frames < seconds_to_frames(min_video_s, timeline.fps):
         print(f"Video {vid_name} too short ({timeline.n_frames} frames), skipping.")
-        return 0
+        return reject_video("video_too_short")
 
-    exchanges = accepted_exchanges(analyse_timeline(timeline, weapon, cfg))
-    jobs = []
-    for n, exchange in enumerate(exchanges):
-        clip_id = f"{exchange.label}_{weapon}_{vid_name}_{n}"
+    exchanges = analyse_timeline(timeline, weapon, cfg)
+    if not exchanges:
+        return reject_video("no_light_detected")
+
+    jobs, job_exchanges = [], []
+    for exchange in accepted_exchanges(exchanges):
+        clip_id = f"{exchange.label}_{weapon}_{vid_name}_{len(jobs)}"
         jobs.append((exchange.window, os.path.join(output_dir, f"{clip_id}.mp4")))
+        job_exchanges.append(exchange)
     saved = write_clips(vid_path, jobs)
+    for (_, path), exchange in zip(jobs, job_exchanges):
+        if path not in saved:
+            exchange.label, exchange.reason = None, "clip_write_incomplete"
+
+    counts.update(count_reasons(exchanges))
+    if rejections_path:
+        append_rejections(rejections_path, vid_name, weapon, exchanges, timeline.fps)
 
     print(f"  Successfully labelled {len(saved)} {weapon.upper()} clips.")
-    return len(saved)
+    return finish(len(saved))
 
 
 def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
@@ -643,6 +752,8 @@ def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
     os.makedirs(clips_dir, exist_ok=True)
 
     total_new_clips = 0
+    reason_counts = Counter()
+    rejection_log = rejections_path(weapon)
 
     for idx, url in enumerate(pending_urls, 1):
         print(f"\n[{idx}/{len(pending_urls)}] Downloading & processing: {url}")
@@ -667,7 +778,10 @@ def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
             if fname.endswith(".mp4"):
                 fpath = os.path.join(precut_dir, fname)
                 try:
-                    count = process_video_file(fpath, clips_dir, weapon=weapon, cfg=cfg)
+                    count = process_video_file(
+                        fpath, clips_dir, weapon=weapon, cfg=cfg,
+                        rejections_path=rejection_log, reason_counts=reason_counts,
+                    )
                     total_new_clips += count
                 except Exception as e:
                     print(f"Error processing {fname}: {e}")
@@ -687,6 +801,10 @@ def run_pipeline(weapon="sabre", max_matches=None, cfg=None):
     print(f"Pipeline complete for {weapon.upper()}!")
     print(f"Generated {total_new_clips} new clips in {clips_dir}.")
     print(f"Total clips now in {clips_dir}: {len(os.listdir(clips_dir))}")
+    print("\nOutcome per candidate exchange (this run):")
+    print(format_reason_counts(reason_counts))
+    print(f"\nRejections of all runs ({rejection_log}):")
+    print(format_reason_counts(read_reason_counts(rejection_log)))
     print("==========================================")
 
 
