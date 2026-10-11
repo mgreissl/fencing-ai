@@ -363,6 +363,99 @@ def track_fencers(
     return _tracks_to_arrays(left, right, len(detections), fps)
 
 
+# ---------------------------------------------------------------------------
+# Weapon side and per-fencer signals (#31)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FencerSignals:
+    """
+    Per-frame raw signals of one fencer; entries are zero where ``valid`` is False.
+
+    Attributes:
+        wrist: (T, 2) weapon wrist position.
+        torso: (T, 2) hip midpoint.
+        extension: (T,) |weapon wrist - weapon shoulder| / torso height.
+        valid: (T,) bool.
+    """
+
+    wrist: np.ndarray
+    torso: np.ndarray
+    extension: np.ndarray
+    valid: np.ndarray
+
+
+def determine_weapon_wrist(
+    keypoints: np.ndarray,
+    keypoint_conf: np.ndarray,
+    valid: np.ndarray,
+    facing: int,
+    conf_threshold: float = 0.3,
+) -> int:
+    """
+    Decide the weapon wrist of a fencer once per clip.
+
+    Each valid frame with both wrists above ``conf_threshold`` votes for the
+    wrist that is further towards the opponent. The majority over the clip wins,
+    so short phases where the back arm swings forward (fleche, recovery) or the
+    weapon arm is withdrawn (parry) do not flip the weapon side.
+
+    Args:
+        keypoints: (T, 17, 2) keypoints of one fencer.
+        keypoint_conf: (T, 17) keypoint confidences.
+        valid: (T,) frames in which the fencer is detected.
+        facing: +1 if the fencer faces towards +x (left fencer), -1 otherwise.
+        conf_threshold: minimum confidence of both wrists for a vote.
+
+    Returns:
+        ``R_WRIST`` or ``L_WRIST``. Defaults to ``R_WRIST`` without votes or on a tie.
+    """
+    usable = (
+        np.asarray(valid, dtype=bool)
+        & (keypoint_conf[:, L_WRIST] >= conf_threshold)
+        & (keypoint_conf[:, R_WRIST] >= conf_threshold)
+    )
+    lead = facing * (keypoints[:, R_WRIST, 0] - keypoints[:, L_WRIST, 0])
+    right_votes = int(np.sum(usable & (lead > 0)))
+    left_votes = int(np.sum(usable & (lead < 0)))
+    return L_WRIST if left_votes > right_votes else R_WRIST
+
+
+def compute_fencer_signals(
+    keypoints: np.ndarray,
+    keypoint_conf: np.ndarray,
+    detected: np.ndarray,
+    weapon_wrist: int,
+    conf_threshold: float = 0.3,
+) -> FencerSignals:
+    """
+    Compute weapon wrist, torso and arm extension of one fencer for all frames.
+
+    A frame is valid if the fencer is detected and both shoulders, both hips,
+    the weapon wrist and its shoulder have confidence >= ``conf_threshold``.
+    """
+    weapon_shoulder = R_SHOULDER if weapon_wrist == R_WRIST else L_SHOULDER
+    required = [L_SHOULDER, R_SHOULDER, L_HIP, R_HIP, weapon_wrist, weapon_shoulder]
+    valid = np.asarray(detected, dtype=bool) & np.all(
+        keypoint_conf[:, required] >= conf_threshold, axis=1
+    )
+
+    sh_mid = (keypoints[:, L_SHOULDER] + keypoints[:, R_SHOULDER]) / 2.0
+    hip_mid = (keypoints[:, L_HIP] + keypoints[:, R_HIP]) / 2.0
+    torso_scale = np.maximum(np.linalg.norm(sh_mid - hip_mid, axis=1), 0.05)
+    wrist = keypoints[:, weapon_wrist]
+    extension = np.linalg.norm(wrist - keypoints[:, weapon_shoulder], axis=1) / torso_scale
+
+    mask = valid[:, None]
+    return FencerSignals(
+        wrist=np.where(mask, wrist, 0.0),
+        torso=np.where(mask, hip_mid, 0.0),
+        extension=np.where(valid, extension, 0.0),
+        valid=valid,
+    )
+
+
 def _get_fencer_metrics(kpts: np.ndarray, is_left_fencer: bool) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Extract lead wrist position, torso position, and torso scale for a fencer.
