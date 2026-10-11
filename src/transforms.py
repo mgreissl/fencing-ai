@@ -1,7 +1,8 @@
 import random
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
+from omegaconf import OmegaConf
 from torchvision.transforms import v2 as T
 
 
@@ -15,10 +16,53 @@ LABEL_TIE = 1
 LABEL_RIGHT = 2
 
 
+def mask_overlay(
+    frames: torch.Tensor,
+    y_min_frac: float,
+    fill: Optional[Sequence[float]] = None,
+) -> torch.Tensor:
+    """
+    Blank the scoreboard/overlay band at the bottom of every frame.
+
+    Rows from ``int(H * y_min_frac)`` to the bottom are set to ``fill``
+    (default: ImageNet mean, i.e. zero after normalisation). Apply it to raw
+    [0, 1] frames before resize and flip so no overlay pixels survive either.
+
+    The fraction is a config value (``data.overlay_mask.y_min_frac``, 0.82 =
+    295 / 360); the overlay geometry module can supply it per source later.
+
+    Args:
+        frames: Tensor (..., C, H, W).
+        y_min_frac: First masked row as a fraction of the frame height.
+        fill: Per-channel fill values, or a scalar.
+
+    Returns:
+        A new tensor; the input is not modified.
+    """
+    height = frames.shape[-2]
+    y_min = min(int(height * y_min_frac), height)
+    if fill is None:
+        fill = IMAGENET_MEAN
+    fill_tensor = torch.as_tensor(fill, dtype=frames.dtype, device=frames.device)
+    out = frames.clone()
+    if y_min < height:
+        out[..., y_min:, :] = fill_tensor.reshape(-1, 1, 1) if fill_tensor.ndim else fill_tensor
+    return out
+
+
+def _overlay_mask_frac(cfg) -> Optional[float]:
+    """``data.overlay_mask.y_min_frac`` if the mask is enabled, else None."""
+    mask = OmegaConf.select(cfg, "data.overlay_mask")
+    if mask is None or not mask.get("enabled", False):
+        return None
+    return float(mask.get("y_min_frac", 0.82))
+
+
 def build_train_transforms(cfg) -> "TrainVideoTransform":
     """Build training-time augmentation pipeline from Hydra config."""
     return TrainVideoTransform(
         frame_size=cfg.data.frame_size,
+        overlay_mask_y_min_frac=_overlay_mask_frac(cfg),
         flip_prob=cfg.augmentation.train.horizontal_flip.prob
         if cfg.augmentation.train.horizontal_flip.enabled
         else 0.0,
@@ -35,7 +79,10 @@ def build_train_transforms(cfg) -> "TrainVideoTransform":
 
 def build_eval_transforms(cfg) -> "EvalVideoTransform":
     """Build evaluation-time (deterministic) transform pipeline."""
-    return EvalVideoTransform(frame_size=cfg.data.frame_size)
+    return EvalVideoTransform(
+        frame_size=cfg.data.frame_size,
+        overlay_mask_y_min_frac=_overlay_mask_frac(cfg),
+    )
 
 
 class TrainVideoTransform:
@@ -51,6 +98,7 @@ class TrainVideoTransform:
     def __init__(
         self,
         frame_size: int = 224,
+        overlay_mask_y_min_frac: Optional[float] = None,
         flip_prob: float = 0.5,
         color_jitter: bool = True,
         brightness: float = 0.2,
@@ -60,6 +108,7 @@ class TrainVideoTransform:
         grayscale_prob: float = 0.0,
     ):
         self.frame_size = frame_size
+        self.overlay_mask_y_min_frac = overlay_mask_y_min_frac
         self.flip_prob = flip_prob
         self.grayscale_prob = grayscale_prob
 
@@ -98,6 +147,10 @@ class TrainVideoTransform:
             Tuple of (augmented_frames, possibly_swapped_label) or
             (augmented_frames, possibly_swapped_label, possibly_flipped_kinematics).
         """
+        # --- Mask scoreboard overlay (before resize and flip) ---
+        if self.overlay_mask_y_min_frac is not None:
+            frames = mask_overlay(frames, self.overlay_mask_y_min_frac)
+
         # --- Direct Resize (preserves both fencers and entire piste) ---
         frames = torch.stack([self.resize(f) for f in frames])
 
@@ -139,8 +192,13 @@ class EvalVideoTransform:
     Preserves full widescreen piste geometry without cropping out fencers.
     """
 
-    def __init__(self, frame_size: int = 224):
+    def __init__(
+        self,
+        frame_size: int = 224,
+        overlay_mask_y_min_frac: Optional[float] = None,
+    ):
         self.frame_size = frame_size
+        self.overlay_mask_y_min_frac = overlay_mask_y_min_frac
         self.transform = T.Compose(
             [
                 T.Resize(
@@ -168,6 +226,8 @@ class EvalVideoTransform:
         Returns:
             Tuple of (transformed_frames, label) or (transformed_frames, label, kinematics).
         """
+        if self.overlay_mask_y_min_frac is not None:
+            frames = mask_overlay(frames, self.overlay_mask_y_min_frac)
         frames = torch.stack([self.transform(f) for f in frames])
         if kinematics is not None:
             return frames, label, kinematics

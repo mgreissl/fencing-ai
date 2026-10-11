@@ -13,6 +13,13 @@ data:
   include_flipped: false
   flipped_dir: "${oc.env:FENCING_FLIPPED_DIR,more_training_data}"
 
+  # Blank the scoreboard/overlay band before resize and flip (shortcut removal).
+  # Rows from y_min_frac * height to the bottom are set to the ImageNet mean;
+  # 0.82 = 295 / 360 for 640x360 sources.
+  overlay_mask:
+    enabled: true
+    y_min_frac: 0.82
+
   # Number of frames to sample per clip (must match model expectation)
   num_frames: 16
   # Spatial resolution fed to the model

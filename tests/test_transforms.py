@@ -57,3 +57,53 @@ def test_build_from_default_config_has_no_dead_crop_settings():
     assert "random_resized_crop" not in cfg.augmentation.train
     transform = build_train_transforms(cfg)
     assert not hasattr(transform, "crop_scale")
+
+
+from src.transforms import (  # noqa: E402
+    IMAGENET_MEAN,
+    EvalVideoTransform,
+    build_eval_transforms,
+    build_train_transforms,
+    mask_overlay,
+)
+
+
+def test_mask_overlay_fills_bottom_rows_only():
+    frames = torch.ones(2, 3, 360, 640)
+    out = mask_overlay(frames, 0.82)
+    assert torch.equal(out[:, :, :295], frames[:, :, :295])
+    expected = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1).expand(2, 3, 65, 640)
+    assert torch.allclose(out[:, :, 295:], expected)
+    assert frames.min() == 1.0  # input not mutated
+
+
+def test_mask_overlay_custom_fill_and_noop():
+    frames = torch.ones(1, 3, 10, 4)
+    assert torch.equal(mask_overlay(frames, 1.0), frames)
+    out = mask_overlay(frames, 0.5, fill=0.0)
+    assert out[:, :, 5:].sum() == 0 and out[:, :, :5].min() == 1.0
+
+
+def test_eval_transform_masks_overlay():
+    frames = torch.ones(2, 3, 360, 640)
+    out, _ = EvalVideoTransform(frame_size=36, overlay_mask_y_min_frac=0.82)(frames, 0)
+    assert torch.allclose(out[:, :, -3:], torch.zeros_like(out[:, :, -3:]), atol=1e-5)
+    assert out[:, :, :20].abs().min() > 0.5  # white area stays bright after norm
+
+
+def _overlay_cfg(enabled=True):
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load("configs/default.yaml")
+    cfg.data.overlay_mask.enabled = enabled
+    return cfg
+
+
+def test_builders_read_overlay_config():
+    cfg = _overlay_cfg()
+    assert cfg.data.overlay_mask.y_min_frac == 0.82
+    assert build_train_transforms(cfg).overlay_mask_y_min_frac == 0.82
+    assert build_eval_transforms(cfg).overlay_mask_y_min_frac == 0.82
+    off = _overlay_cfg(enabled=False)
+    assert build_train_transforms(off).overlay_mask_y_min_frac is None
+    assert build_eval_transforms(off).overlay_mask_y_min_frac is None
