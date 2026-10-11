@@ -152,3 +152,58 @@ def test_rejection_reason_reaches_the_exchange():
     (exchange,) = pp.analyse_timeline(timeline, "sabre")
     assert exchange.label is None
     assert exchange.reason == "score_inconsistent_with_lights"
+
+
+# --- foil On-Off / Off-On with unchanged score (#54) ------------------------
+
+@pytest.mark.parametrize("hit_type, expected", [("On-Off", "R"), ("Off-On", "L")])
+def test_off_target_unchanged_defaults_to_priority(hit_type, expected):
+    decision = pp.label_exchange(hit_type, BEFORE, BEFORE, "foil")
+    assert decision.label == expected
+
+
+@pytest.mark.parametrize("hit_type", ["On-Off", "Off-On"])
+def test_off_target_unchanged_can_be_rejected(hit_type):
+    decision = pp.label_exchange(hit_type, BEFORE, BEFORE, "foil",
+                                 on_off_unchanged="reject")
+    assert decision.label is None
+    assert decision.reason == "off_target_score_unchanged"
+
+
+def test_reject_mode_keeps_scored_on_off_and_on_on_tie():
+    scored = pp.label_exchange("On-Off", BEFORE, (6, 5), "foil",
+                               on_off_unchanged="reject")
+    tie = pp.label_exchange("On-On", BEFORE, BEFORE, "foil",
+                            on_off_unchanged="reject")
+    assert scored.label == "L" and tie.label == "T"
+
+
+def test_on_off_unchanged_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        pp.label_exchange("On-Off", BEFORE, BEFORE, "foil",
+                          on_off_unchanged="relabel")
+
+
+def test_pipeline_config_passes_mode_to_analysis():
+    def scores(i):
+        return (5, 5)
+
+    timeline = make_timeline(runs=[(600, 700)], left_state=pp.STATE_ON,
+                             right_state=pp.STATE_OFF, scores=scores)
+    default = pp.analyse_timeline(timeline, "foil")
+    strict = pp.analyse_timeline(
+        timeline, "foil", pp.PipelineConfig(on_off_unchanged="reject"))
+    assert [e.label for e in default] == ["R"]
+    assert [e.reason for e in strict] == ["off_target_score_unchanged"]
+
+
+def test_on_off_unchanged_cli_option():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    pp.add_cli_args(parser)
+    assert pp.config_from_args(parser.parse_args([])).on_off_unchanged == "priority"
+    args = parser.parse_args(["--on-off-unchanged", "reject"])
+    assert pp.config_from_args(args).on_off_unchanged == "reject"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--on-off-unchanged", "relabel"])

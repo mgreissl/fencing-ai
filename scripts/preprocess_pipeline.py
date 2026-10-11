@@ -9,7 +9,8 @@ Processes match video URLs from {weapon}_videos.txt:
 4. Saves clips aligned to the light onset (PRE_S before to POST_S after, at
    the source fps) into data/clips/{weapon}/ and describes every clip in
    data/clips/{weapon}/manifest.csv. Rejections go to
-   state/rejections_{weapon}.csv, progress to state/v2/processed_{weapon}_urls.txt.
+   state/v2/rejections_{weapon}.csv, progress to
+   state/v2/processed_{weapon}_urls.txt.
 5. Removes match video immediately to conserve disk space.
 """
 
@@ -88,7 +89,11 @@ def check_score(frame):
 #   Foil only, one on-target and one off-target light: the off-target hit does
 #   not score, so the score only goes up for the on-target fencer if he had
 #   priority (On-Off +1 left -> L). If the score stays unchanged the referee
-#   gave priority to the off-target fencer (On-Off -> R, Off-On -> L).
+#   gave priority to the off-target fencer (On-Off -> R, Off-On -> L). That
+#   outcome also covers simultaneous actions and annulments, so T and R/L mean
+#   different things (T: "no point awarded", R/L: "priority to the off-target
+#   fencer") for the same unchanged score. ``on_off_unchanged`` selects:
+#   "priority" (default) keeps the R/L label, "reject" drops these exchanges.
 #
 # Epee has no priority; both touches count. The label is the fencer who scored
 # (the one whose score went up), not the one who was hit:
@@ -120,12 +125,20 @@ def _reject(reason):
     return LabelDecision(None, reason)
 
 
-def label_exchange(hit_type, before, after, weapon="foil"):
+ON_OFF_UNCHANGED_MODES = ("priority", "reject")
+
+
+def label_exchange(hit_type, before, after, weapon="foil",
+                   on_off_unchanged="priority"):
     """Label one exchange from the light pattern and the score change.
 
     ``before`` and ``after`` are (left, right) scores; ``after`` must be the
     stabilised, confirmed score (see ``resolve_score_after``).
+    ``on_off_unchanged`` decides what a foil On-Off / Off-On with unchanged
+    score becomes: ``priority`` (label for the off-target fencer) or ``reject``.
     """
+    if on_off_unchanged not in ON_OFF_UNCHANGED_MODES:
+        raise ValueError(f"on_off_unchanged must be one of {ON_OFF_UNCHANGED_MODES}")
     delta_left, delta_right = after[0] - before[0], after[1] - before[1]
     if delta_left < 0 or delta_right < 0:
         return _reject("negative_score_change")
@@ -137,7 +150,7 @@ def label_exchange(hit_type, before, after, weapon="foil"):
 
     if weapon == "epee":
         return _label_epee(hit_type, delta)
-    return _label_priority(hit_type, delta)
+    return _label_priority(hit_type, delta, on_off_unchanged)
 
 
 def _label_epee(hit_type, delta):
@@ -159,9 +172,12 @@ def _label_epee(hit_type, delta):
     return _reject("score_inconsistent_with_lights")
 
 
-def _label_priority(hit_type, delta):
+def _label_priority(hit_type, delta, on_off_unchanged="priority"):
     if delta == (1, 1):
         return _reject("both_scores_increased")
+    if (on_off_unchanged == "reject" and delta == (0, 0)
+            and hit_type in ("On-Off", "Off-On")):
+        return _reject("off_target_score_unchanged")
     table = {
         "On-On": {(1, 0): "L", (0, 1): "R", (0, 0): "T"},
         "On-No": {(1, 0): "L"},
@@ -293,6 +309,7 @@ class PipelineConfig:
     n_stable_after: int = 4       # identical reads needed after the onset
     score_timeout_s: float = 12.0  # wait this long for the referee decision
     min_unchanged_s: float = 3.0  # unchanged score counts only after this long
+    on_off_unchanged: str = "priority"  # foil On-Off/Off-On, score unchanged
 
 
 @dataclass
@@ -537,7 +554,8 @@ def analyse_timeline(timeline, weapon, cfg=None):
         elif after.kind not in ("changed", "unchanged"):
             exchange.reason = AFTER_REJECTION[after.kind]
         else:
-            decision = label_exchange(hit_type, before, after.score, weapon)
+            decision = label_exchange(hit_type, before, after.score, weapon,
+                                      cfg.on_off_unchanged)
             if decision.label is None:
                 exchange.reason = decision.reason
             else:
@@ -1078,6 +1096,11 @@ def add_cli_args(parser):
                         help="seconds kept after the light onset")
     parser.add_argument("--clip-fps", type=float, default=None,
                         help="fps of saved clips (default: native source fps)")
+    parser.add_argument("--on-off-unchanged", choices=ON_OFF_UNCHANGED_MODES,
+                        default="priority",
+                        help="foil On-Off / Off-On with unchanged score: "
+                             "'priority' labels the off-target fencer (default), "
+                             "'reject' drops the exchange")
     parser.add_argument("--resume-legacy", action="store_true",
                         help="also skip URLs listed in the progress logs of the "
                              "old pipeline (state/processed_*.txt, "
@@ -1103,7 +1126,8 @@ def add_cli_args(parser):
 def config_from_args(args):
     """Build a PipelineConfig from parsed command line options."""
     return PipelineConfig(pre_s=args.pre_s, post_s=args.post_s,
-                          clip_fps=args.clip_fps)
+                          clip_fps=args.clip_fps,
+                          on_off_unchanged=args.on_off_unchanged)
 
 
 def download_options_from_args(args):
