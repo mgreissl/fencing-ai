@@ -13,6 +13,9 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from src.metrics import macro_f1, per_class_recall
+from src.seed import make_generator, seed_everything, seed_worker
+
 log = logging.getLogger(__name__)
 
 
@@ -44,6 +47,19 @@ def _setup_wandb(cfg: DictConfig) -> bool:
         )
         log.info("W&B running in offline mode (run data saved locally)")
     return True
+
+
+SELECTION_METRICS = {"macro_f1": "val/macro_f1", "accuracy": "val/accuracy"}
+
+
+def _selection_key(name: str) -> str:
+    """Validation metric key for `training.selection_metric`."""
+    if name not in SELECTION_METRICS:
+        raise ValueError(
+            f"training.selection_metric must be one of {sorted(SELECTION_METRICS)}, "
+            f"got {name!r}"
+        )
+    return SELECTION_METRICS[name]
 
 
 def _build_scheduler(optimizer, cfg, steps_per_epoch: int):
@@ -226,7 +242,12 @@ def _validate(
     metrics = {
         "val/loss": total_loss / max(total, 1),
         "val/accuracy": val_acc,
+        "val/macro_f1": macro_f1(all_labels, all_preds),
     }
+    class_names = list(cfg.model.class_names)
+    for name, rec in zip(class_names, per_class_recall(all_labels, all_preds)):
+        if not np.isnan(rec):
+            metrics[f"val/recall_{name}"] = float(rec)
 
     # Compute per-weapon metrics
     weapon_names = {0: "foil", 1: "sabre", 2: "epee"}
@@ -388,8 +409,13 @@ def main(cfg: DictConfig):
     # --- W&B ---
     wandb_active = _setup_wandb(cfg)
 
+    # --- Seed ---
+    seed = int(cfg.training.seed)
+    seed_everything(seed)
+
     # --- Data ---
-    from src.dataset import discover_clips, make_splits, FencingVideoDataset
+    from src.dataset import discover_clips, FencingVideoDataset
+    from src.splits import build_splits, save_split_manifest, select_split
     from src.transforms import build_train_transforms, build_eval_transforms
 
     samples = discover_clips(
@@ -398,28 +424,47 @@ def main(cfg: DictConfig):
         include_flipped=getattr(cfg.data, "include_flipped", False),
         flipped_dir=getattr(cfg.data, "flipped_dir", None),
         max_clips=getattr(cfg.data, "max_clips", None),
+        seed=cfg.data.split_seed,
     )
 
     if len(samples) == 0:
         log.error(
-            "No clips found! Please ensure .mp4 files with L/R/T prefixes "
-            f"exist in {cfg.data.clips_dir}"
+            "No clips found! Please ensure clips (manifest.csv or L/R/T-prefixed "
+            f".mp4 files) exist in {cfg.data.clips_dir}"
         )
         sys.exit(1)
 
-    train_samples, val_samples, test_samples = make_splits(
+    cv_folds = int(getattr(cfg.data, "cv_folds", 0) or 0)
+    cv_fold = int(getattr(cfg.data, "cv_fold", 0) or 0)
+    split_records = build_splits(
         samples,
+        group_by=cfg.data.group_by,
         train_ratio=cfg.data.train_ratio,
         val_ratio=cfg.data.val_ratio,
         test_ratio=cfg.data.test_ratio,
         seed=cfg.data.split_seed,
+        cv_folds=cv_folds,
+        cv_fold=cv_fold,
+        use_manifest_split=getattr(cfg.data, "use_manifest_split", False),
     )
+    train_samples = select_split(split_records, "train")
+    val_samples = select_split(split_records, "val")
+
+    # Persist the split next to the checkpoint; evaluate.py reads it back.
+    checkpoint_dir = Path(cfg.training.checkpoint_dir)
+    if cv_folds > 0:
+        checkpoint_dir = checkpoint_dir / f"fold{cv_fold}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    save_split_manifest(split_records, checkpoint_dir)
 
     train_transform = build_train_transforms(cfg)
     eval_transform = build_eval_transforms(cfg)
 
-    sampling_mode = getattr(cfg.data, "sampling_mode", "end_weighted")
+    sampling_mode = getattr(cfg.data, "sampling_mode", "onset_window")
     log.info(f"Using temporal frame sampling mode: {sampling_mode}")
+    window_kwargs = dict(
+        window_pre_s=cfg.data.window_pre_s, window_post_s=cfg.data.window_post_s
+    )
 
     use_kinematics = getattr(cfg.model, "use_kinematics", False)
 
@@ -431,6 +476,7 @@ def main(cfg: DictConfig):
         temporal_jitter=cfg.augmentation.train.temporal_jitter.enabled,
         max_shift=cfg.augmentation.train.temporal_jitter.max_shift,
         use_kinematics=use_kinematics,
+        **window_kwargs,
     )
     val_dataset = FencingVideoDataset(
         samples=val_samples,
@@ -438,6 +484,7 @@ def main(cfg: DictConfig):
         transform=eval_transform,
         sampling_mode=sampling_mode,
         use_kinematics=use_kinematics,
+        **window_kwargs,
     )
 
     train_loader = DataLoader(
@@ -447,6 +494,8 @@ def main(cfg: DictConfig):
         num_workers=cfg.data.num_workers,
         pin_memory=cfg.data.pin_memory,
         drop_last=True,
+        generator=make_generator(seed),
+        worker_init_fn=seed_worker,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -454,6 +503,7 @@ def main(cfg: DictConfig):
         shuffle=False,
         num_workers=cfg.data.num_workers,
         pin_memory=cfg.data.pin_memory,
+        worker_init_fn=seed_worker,
     )
 
     # --- Model ---
@@ -474,10 +524,10 @@ def main(cfg: DictConfig):
     scheduler = _build_scheduler(optimizer, cfg, steps_per_epoch)
 
     # --- Training Loop ---
+    selection_key = _selection_key(cfg.training.selection_metric)
+    best_score = -1.0
     best_val_acc = 0.0
     patience_counter = 0
-    checkpoint_dir = Path(cfg.training.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     log.info(f"Starting training for {cfg.training.epochs} epochs")
     log.info(f"  Batch size: {cfg.training.batch_size}")
@@ -516,12 +566,15 @@ def main(cfg: DictConfig):
         )
         log.info(
             f"  Val   Loss: {val_metrics['val/loss']:.4f}  "
-            f"Acc: {val_metrics['val/accuracy']:.4f}"
+            f"Acc: {val_metrics['val/accuracy']:.4f}  "
+            f"MacroF1: {val_metrics['val/macro_f1']:.4f}"
         )
 
         # --- Checkpointing ---
         val_acc = val_metrics["val/accuracy"]
-        if val_acc > best_val_acc:
+        score = val_metrics[selection_key]
+        if score > best_score:
+            best_score = score
             best_val_acc = val_acc
             patience_counter = 0
             ckpt_path = checkpoint_dir / "best_model.pt"
@@ -531,11 +584,15 @@ def main(cfg: DictConfig):
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_accuracy": val_acc,
+                    "val_macro_f1": val_metrics["val/macro_f1"],
+                    "selection_metric": cfg.training.selection_metric,
                     "config": OmegaConf.to_container(cfg, resolve=True),
                 },
                 ckpt_path,
             )
-            log.info(f"  ✓ New best model saved (val_acc={val_acc:.4f})")
+            log.info(
+                f"  ✓ New best model saved ({cfg.training.selection_metric}={score:.4f})"
+            )
 
             # Save as W&B artifact
             if wandb_active:
@@ -544,7 +601,11 @@ def main(cfg: DictConfig):
                 artifact = wandb.Artifact(
                     name="best-model",
                     type="model",
-                    metadata={"val_accuracy": val_acc, "epoch": epoch},
+                    metadata={
+                        "val_accuracy": val_acc,
+                        "val_macro_f1": val_metrics["val/macro_f1"],
+                        "epoch": epoch,
+                    },
                 )
                 artifact.add_file(str(ckpt_path))
                 wandb.log_artifact(artifact)
@@ -562,17 +623,21 @@ def main(cfg: DictConfig):
         ):
             log.info(
                 f"Early stopping triggered after {epoch + 1} epochs "
-                f"(best val_acc={best_val_acc:.4f})"
+                f"(best {cfg.training.selection_metric}={best_score:.4f})"
             )
             break
 
-    log.info(f"\nTraining complete! Best val accuracy: {best_val_acc:.4f}")
+    log.info(
+        f"\nTraining complete! Best {cfg.training.selection_metric}: "
+        f"{best_score:.4f} (val accuracy {best_val_acc:.4f})"
+    )
 
     # --- Final W&B summary ---
     if wandb_active:
         import wandb
 
         wandb.summary["best_val_accuracy"] = best_val_acc
+        wandb.summary[f"best_{cfg.training.selection_metric}"] = best_score
         wandb.finish()
 
     return best_val_acc

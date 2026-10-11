@@ -23,18 +23,33 @@ data:
   val_ratio: 0.15
   test_ratio: 0.15
 
-  # Random seed for reproducible splits
+  # Random seed for reproducible splits (also seeds the max_clips subset)
   split_seed: 42
 
-  # Max clips to load (null = all). Useful for smoke tests.
+  # Split grouping: clips of one 'match' (or 'tournament') never span splits
+  group_by: "match"
+  # Use the `split` column of the manifest if every row has one
+  use_manifest_split: false
+  # Grouped k-fold CV: cv_folds=0 disables; otherwise fold `cv_fold` is test,
+  # fold cv_fold+1 is val, the rest train (ratios above are ignored)
+  cv_folds: 0
+  cv_fold: 0
+
+  # Max clips to load (null = all): label-stratified random subset (seeded)
   max_clips: null
 
   # DataLoader workers (0 = main process; safe default for macOS)
   num_workers: 0
   pin_memory: false
 
-  # Temporal sampling strategy: 'end_weighted' (heavier sampling at the final blade clash) or 'uniform'
-  sampling_mode: "end_weighted"
+  # Temporal sampling strategy:
+  #   'onset_window': evenly spaced frames in [onset - window_pre_s, onset + window_post_s]
+  #                   (needs light_frame_in_clip + clip_fps in the manifest, else uniform)
+  #   'end_weighted': denser sampling in the second half of the clip
+  #   'uniform':      evenly spaced over the whole clip
+  sampling_mode: "onset_window"
+  window_pre_s: 1.0
+  window_post_s: 0.25
 
 # --- Model -------------------------------------------------------------------
 model:
@@ -75,6 +90,11 @@ model:
 
 # --- Training ----------------------------------------------------------------
 training:
+  # Seeds python, numpy, torch, DataLoader shuffling and workers
+  seed: 42
+  # Metric for checkpoint selection / early stopping: macro_f1 | accuracy
+  selection_metric: "macro_f1"
+
   batch_size: 4
   epochs: 20
   lr: 1.5e-4
@@ -100,6 +120,15 @@ training:
 
   # Device preference: auto | mps | cuda | cpu
   device: "auto"
+
+# --- Evaluation --------------------------------------------------------------
+eval:
+  # Split of the checkpoint's saved split file to evaluate
+  split: "test"
+  # Output directory for predictions/metrics (null = checkpoint_dir)
+  output_dir: null
+  # Bins for expected calibration error
+  ece_bins: 10
 
 # --- Augmentation ------------------------------------------------------------
 augmentation:
