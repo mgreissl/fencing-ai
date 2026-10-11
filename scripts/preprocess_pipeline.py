@@ -310,6 +310,10 @@ class PipelineConfig:
     score_timeout_s: float = 12.0  # wait this long for the referee decision
     min_unchanged_s: float = 3.0  # unchanged score counts only after this long
     on_off_unchanged: str = "priority"  # foil On-Off/Off-On, score unchanged
+    # The score is checked again right before the next onset (a video review
+    # can change the decision after score_timeout_s), looking ahead at most
+    # this long so that a bout reset or break is not mistaken for a review.
+    late_score_max_s: float = 120.0
 
 
 @dataclass
@@ -491,6 +495,19 @@ def accepted_exchanges(exchanges):
     return [e for e in exchanges if e.accepted]
 
 
+def score_changed_later(frames, scores, after, onset, next_onset, n_frames, fps,
+                        cfg):
+    """True if a stable, different score shows up before the next light onset.
+
+    Catches decisions that change after the post-touch window, for example a
+    video review. Reads that are missing or unstable do not count as a change.
+    """
+    limit = onset + seconds_to_frames(cfg.late_score_max_s, fps)
+    boundary = min(b for b in (next_onset, n_frames, limit) if b is not None)
+    later, _ = read_score_before(frames, scores, boundary, cfg.n_stable_before)
+    return later is not None and later != after
+
+
 AFTER_REJECTION = {
     "unreadable": "score_unreadable_after",
     "unstable": "score_unstable_after",
@@ -558,6 +575,9 @@ def analyse_timeline(timeline, weapon, cfg=None):
                                       cfg.on_off_unchanged)
             if decision.label is None:
                 exchange.reason = decision.reason
+            elif score_changed_later(frames, scores, after.score, onset,
+                                     next_onset, timeline.n_frames, fps, cfg):
+                exchange.reason = "score_changed_later"
             else:
                 exchange.label = decision.label
                 exchange.score_before, exchange.score_after = before, after.score
