@@ -257,7 +257,12 @@ def merge_checkpoint_config(
     Precedence (low to high): current defaults (fills keys that older
     checkpoints lack) < config stored in the checkpoint < explicit CLI
     overrides (``key=value`` strings; ``~``-deletions and ``hydra.*`` skipped).
+
+    The checkpoint's ``eval.*`` block is ignored: evaluation settings (split,
+    flip_tta, hybrid_rules, ...) come from the current config, not from the
+    run that produced the checkpoint.
     """
+    checkpoint_cfg = {k: v for k, v in checkpoint_cfg.items() if k != "eval"}
     explicit = []
     for item in overrides:
         item = item.strip()
@@ -272,6 +277,12 @@ def merge_checkpoint_config(
     )
     OmegaConf.resolve(merged)
     return merged
+
+
+def effective_eval_summary(cfg: DictConfig) -> str:
+    """One line with every effective ``eval.*`` setting."""
+    items = OmegaConf.to_container(cfg.eval, resolve=True)
+    return ", ".join(f"{k}={v}" for k, v in items.items())
 
 
 def _cli_overrides() -> list[str]:
@@ -406,6 +417,7 @@ def main(cfg: DictConfig):
         log.error("Checkpoint has no stored config; cannot rebuild the model")
         sys.exit(1)
     cfg = merge_checkpoint_config(cfg, checkpoint["config"], _cli_overrides())
+    log.info(f"Effective eval config: {effective_eval_summary(cfg)}")
 
     device = get_device(cfg.training.device)
     log.info(f"Using device: {device}")

@@ -88,3 +88,45 @@ def test_prediction_rows_carry_system_and_model_pred():
     )
     assert rows[0]["pred"] == "L" and rows[0]["model_pred"] == "R"
     assert rows[0]["source"] == "rule"
+
+
+EVAL_BASE = OmegaConf.create(
+    {
+        **OmegaConf.to_container(BASE),
+        "eval": {"split": "test", "flip_tta": True, "hybrid_rules": True},
+    }
+)
+EVAL_CKPT = {
+    **CKPT,
+    "eval": {"split": "val", "flip_tta": False, "legacy_key": 1},
+}
+
+
+def test_checkpoint_eval_settings_do_not_override_current_eval_config():
+    cfg = merge_checkpoint_config(EVAL_BASE, EVAL_CKPT, [])
+    assert cfg.eval.split == "test"
+    assert cfg.eval.flip_tta is True
+    assert cfg.eval.hybrid_rules is True
+    assert "legacy_key" not in cfg.eval
+    assert cfg.data.num_frames == 8  # non-eval settings still from checkpoint
+
+
+def test_explicit_eval_override_still_wins():
+    cfg = merge_checkpoint_config(EVAL_BASE, EVAL_CKPT, ["eval.split=val"])
+    assert cfg.eval.split == "val"
+    assert cfg.eval.flip_tta is True
+
+
+def test_checkpoint_dict_is_not_mutated():
+    ckpt = {**EVAL_CKPT}
+    merge_checkpoint_config(EVAL_BASE, ckpt, [])
+    assert "eval" in ckpt
+
+
+def test_effective_eval_summary_lists_all_eval_keys():
+    from src.evaluate import effective_eval_summary
+
+    cfg = merge_checkpoint_config(EVAL_BASE, EVAL_CKPT, [])
+    text = effective_eval_summary(cfg)
+    assert "split=test" in text and "flip_tta=True" in text
+    assert "hybrid_rules=True" in text
