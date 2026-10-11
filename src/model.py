@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from src.kinematics import KINEMATIC_FEATURE_DIM
 from transformers import VideoMAEForVideoClassification, VideoMAEConfig
 
 log = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ class KinematicEncoder(nn.Module):
     Captures temporal acceleration spikes, velocity differences, and arm extensions.
     """
 
-    def __init__(self, in_features: int = 16, hidden_dim: int = 64, out_dim: int = 128):
+    def __init__(self, in_features: int = KINEMATIC_FEATURE_DIM, hidden_dim: int = 64, out_dim: int = 128):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(in_features, hidden_dim, kernel_size=3, padding=1),
@@ -107,7 +108,7 @@ class FencingVideoMAE(nn.Module):
         num_classes: int = 3,
         dropout: float = 0.3,
         use_kinematics: bool = False,
-        kinematics_in_features: int = 16,
+        kinematics_in_features: int = KINEMATIC_FEATURE_DIM,
         kinematics_hidden_dim: int = 64,
         kinematics_out_dim: int = 128,
     ):
@@ -270,7 +271,7 @@ def build_model(cfg) -> FencingVideoMAE:
     lora_layers = list(getattr(cfg.model.lora, "layers", [8, 9, 10, 11])) if hasattr(cfg.model, "lora") else [8, 9, 10, 11]
 
     use_kinematics = getattr(cfg.model, "use_kinematics", False)
-    kin_in = getattr(cfg.model.kinematics, "feature_dim", 16) if hasattr(cfg.model, "kinematics") else 16
+    kin_in = getattr(cfg.model.kinematics, "feature_dim", KINEMATIC_FEATURE_DIM) if hasattr(cfg.model, "kinematics") else KINEMATIC_FEATURE_DIM
     kin_hidden = getattr(cfg.model.kinematics, "hidden_dim", 64) if hasattr(cfg.model, "kinematics") else 64
     kin_out = getattr(cfg.model.kinematics, "out_dim", 128) if hasattr(cfg.model, "kinematics") else 128
 

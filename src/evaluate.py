@@ -336,7 +336,11 @@ def main(cfg: DictConfig):
     log.info("=" * 60)
 
     from src.model import get_device, build_model
-    from src.dataset import FencingVideoDataset, filter_readable_clips
+    from src.dataset import (
+        FencingVideoDataset,
+        filter_readable_clips,
+        kinematics_dataset_kwargs,
+    )
     from src.splits import load_split_manifest, select_split
     from src.transforms import build_eval_transforms
 
@@ -379,13 +383,12 @@ def main(cfg: DictConfig):
         sys.exit(1)
 
     eval_transform = build_eval_transforms(cfg)
-    use_kinematics = getattr(cfg.model, "use_kinematics", False)
     test_dataset = FencingVideoDataset(
         samples=test_samples,
         num_frames=cfg.data.num_frames,
         transform=eval_transform,
         sampling_mode=cfg.data.sampling_mode,
-        use_kinematics=use_kinematics,
+        **kinematics_dataset_kwargs(cfg),
         window_pre_s=cfg.data.window_pre_s,
         window_post_s=cfg.data.window_post_s,
     )

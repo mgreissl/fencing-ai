@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.kinematics import load_or_compute_kinematics, select_kinematic_frames
 from src.manifest import ClipRecord, load_weapon_records, merge_records
 from src.splits import stratified_subset
 
@@ -363,6 +364,27 @@ def filter_readable_clips(records: list[ClipRecord]) -> list[ClipRecord]:
     return valid
 
 
+def kinematics_dataset_kwargs(cfg) -> dict:
+    """
+    FencingVideoDataset kwargs for the kinematics stream from a Hydra config.
+
+    Reads ``model.use_kinematics`` and ``model.kinematics.{cache_dir, settings,
+    compute_if_missing}`` (defaults: data/kinematics, None, False).
+    """
+    from omegaconf import OmegaConf
+
+    kin = getattr(cfg.model, "kinematics", None)
+    settings = getattr(kin, "settings", None) if kin is not None else None
+    if settings is not None:
+        settings = OmegaConf.to_container(settings, resolve=True)
+    return {
+        "use_kinematics": bool(getattr(cfg.model, "use_kinematics", False)),
+        "kinematics_cache_dir": str(getattr(kin, "cache_dir", None) or "data/kinematics"),
+        "kinematics_settings": settings,
+        "kinematics_compute_if_missing": bool(getattr(kin, "compute_if_missing", False)),
+    }
+
+
 class FencingVideoDataset(Dataset):
     """
     PyTorch Dataset for fencing video clips.
@@ -383,6 +405,8 @@ class FencingVideoDataset(Dataset):
         kinematics_cache_dir: str = "data/kinematics",
         window_pre_s: float = 1.0,
         window_post_s: float = 0.25,
+        kinematics_settings: Optional[dict] = None,
+        kinematics_compute_if_missing: bool = False,
     ):
         self.samples = samples
         self.num_frames = num_frames
@@ -392,6 +416,8 @@ class FencingVideoDataset(Dataset):
         self.max_shift = max_shift
         self.use_kinematics = use_kinematics
         self.kinematics_cache_dir = kinematics_cache_dir
+        self.kinematics_settings = kinematics_settings
+        self.kinematics_compute_if_missing = kinematics_compute_if_missing
         self.window_pre_s = window_pre_s
         self.window_post_s = window_post_s
 
@@ -404,8 +430,10 @@ class FencingVideoDataset(Dataset):
         label = sample.label_id
         weapon_id = sample.weapon_id
 
+        sampled: list[int] = []
+
         def index_fn(total_frames: int) -> list[int]:
-            return sample_frame_indices(
+            sampled[:] = sample_frame_indices(
                 total_frames,
                 self.num_frames,
                 sampling_mode=self.sampling_mode,
@@ -416,33 +444,25 @@ class FencingVideoDataset(Dataset):
                 window_pre_s=self.window_pre_s,
                 window_post_s=self.window_post_s,
             )
+            return sampled
 
         try:
             frames = read_frames(path, index_fn)  # opens the video once
         except Exception as e:
             raise RuntimeError(f"Failed to read video {path}: {e}") from e
 
-        # Kinematic feature extraction & caching
+        # Kinematics: full-rate cached features, rows picked at the video indices
         kinematics = None
         if self.use_kinematics:
-            os.makedirs(self.kinematics_cache_dir, exist_ok=True)
-            fname = os.path.splitext(os.path.basename(path))[0]
-            cache_file = os.path.join(self.kinematics_cache_dir, f"{fname}.npy")
-            if os.path.exists(cache_file):
-                try:
-                    kin_feats = np.load(cache_file)
-                except Exception:
-                    from src.kinematics import extract_kinematic_features
-
-                    kin_feats = extract_kinematic_features(frames)
-                    np.save(cache_file, kin_feats)
-            else:
-                from src.kinematics import extract_kinematic_features
-
-                kin_feats = extract_kinematic_features(frames)
-                np.save(cache_file, kin_feats)
-
-            kinematics = torch.from_numpy(kin_feats).float()
+            features = load_or_compute_kinematics(
+                path,
+                self.kinematics_cache_dir,
+                settings=self.kinematics_settings,
+                compute_if_missing=self.kinematics_compute_if_missing,
+            )
+            kinematics = torch.from_numpy(
+                select_kinematic_frames(features, sampled)
+            ).float()
 
         # Apply transforms (including dynamic horizontal flip & label/kinematics swap)
         if self.transform is not None:

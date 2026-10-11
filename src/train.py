@@ -414,7 +414,7 @@ def main(cfg: DictConfig):
     seed_everything(seed)
 
     # --- Data ---
-    from src.dataset import discover_clips, FencingVideoDataset
+    from src.dataset import discover_clips, FencingVideoDataset, kinematics_dataset_kwargs
     from src.splits import build_splits, save_split_manifest, select_split
     from src.transforms import build_train_transforms, build_eval_transforms
 
@@ -466,7 +466,7 @@ def main(cfg: DictConfig):
         window_pre_s=cfg.data.window_pre_s, window_post_s=cfg.data.window_post_s
     )
 
-    use_kinematics = getattr(cfg.model, "use_kinematics", False)
+    kin_kwargs = kinematics_dataset_kwargs(cfg)
 
     train_dataset = FencingVideoDataset(
         samples=train_samples,
@@ -475,7 +475,7 @@ def main(cfg: DictConfig):
         sampling_mode=sampling_mode,
         temporal_jitter=cfg.augmentation.train.temporal_jitter.enabled,
         max_shift=cfg.augmentation.train.temporal_jitter.max_shift,
-        use_kinematics=use_kinematics,
+        **kin_kwargs,
         **window_kwargs,
     )
     val_dataset = FencingVideoDataset(
@@ -483,7 +483,7 @@ def main(cfg: DictConfig):
         num_frames=cfg.data.num_frames,
         transform=eval_transform,
         sampling_mode=sampling_mode,
-        use_kinematics=use_kinematics,
+        **kin_kwargs,
         **window_kwargs,
     )
 

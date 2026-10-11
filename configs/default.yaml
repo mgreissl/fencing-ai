@@ -73,8 +73,14 @@ model:
   # Kinematics & Sword-Arm Velocity Stream
   use_kinematics: true
   kinematics:
-    feature_dim: 16
+    feature_dim: 21
     hidden_dim: 128
+    # Directory of cached full-rate features (see scripts/precompute_kinematics.py)
+    cache_dir: "data/kinematics"
+    # Optional overrides of DEFAULT_KINEMATICS_SETTINGS (null = defaults)
+    settings: null
+    # false: a missing cache entry raises; true: compute pose features on the fly
+    compute_if_missing: false
 
   # Classification head config
   head:

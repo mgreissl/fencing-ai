@@ -95,7 +95,7 @@ class TrainVideoTransform:
         Args:
             frames: Tensor of shape (T, C, H, W) with values in [0, 1].
             label: Integer class label.
-            kinematics: Optional kinematic tensor (T, 16).
+            kinematics: Optional kinematic tensor (T, 21).
 
         Returns:
             Tuple of (augmented_frames, possibly_swapped_label) or
@@ -172,7 +172,7 @@ class EvalVideoTransform:
         Args:
             frames: Tensor of shape (T, C, H, W) with values in [0, 1].
             label: Integer class label (unchanged).
-            kinematics: Optional kinematic tensor (T, 16).
+            kinematics: Optional kinematic tensor (T, 21).
 
         Returns:
             Tuple of (transformed_frames, label) or (transformed_frames, label, kinematics).
