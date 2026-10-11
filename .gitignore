@@ -31,6 +31,7 @@ checkpoints/
 
 # Data & Video Clips
 data/
+data/kinematics/
 precut*/
 *.mp4
 *.mkv
@@ -47,3 +48,9 @@ preinception_data/
 # Secrets & Local Configs
 .netrc
 .env
+
+# Pipeline state
+state/
+
+# Testing
+.pytest_cache/
