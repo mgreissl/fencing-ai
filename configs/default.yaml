@@ -63,6 +63,9 @@ data:
   #   'end_weighted': denser sampling in the second half of the clip
   #   'uniform':      evenly spaced over the whole clip
   sampling_mode: "onset_window"
+  # onset_window needs light_frame_in_clip + clip_fps; clips without them are
+  # sampled uniformly (counted and logged once). true = drop such clips instead
+  require_onset: false
   window_pre_s: 1.0
   window_post_s: 0.25
 

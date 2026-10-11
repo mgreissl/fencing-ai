@@ -438,7 +438,9 @@ def kinematics_dataset_kwargs(cfg) -> dict:
     FencingVideoDataset kwargs for the kinematics stream from a Hydra config.
 
     Reads ``model.use_kinematics`` and ``model.kinematics.{cache_dir, settings,
-    compute_if_missing}`` (defaults: data/kinematics, None, False).
+    compute_if_missing}`` (defaults: data/kinematics, None, False). Also carries
+    ``data.require_onset`` (default False), so every caller that spreads these
+    kwargs into the dataset picks it up.
     """
     from omegaconf import OmegaConf
 
@@ -451,7 +453,17 @@ def kinematics_dataset_kwargs(cfg) -> dict:
         "kinematics_cache_dir": str(getattr(kin, "cache_dir", None) or "data/kinematics"),
         "kinematics_settings": settings,
         "kinematics_compute_if_missing": bool(getattr(kin, "compute_if_missing", False)),
+        "require_onset": bool(getattr(getattr(cfg, "data", None), "require_onset", False)),
     }
+
+
+def _has_onset(record: ClipRecord) -> bool:
+    """True if the record can drive onset-window sampling."""
+    return (
+        record.light_frame_in_clip is not None
+        and record.clip_fps is not None
+        and record.clip_fps > 0
+    )
 
 
 class FencingVideoDataset(Dataset):
@@ -476,7 +488,25 @@ class FencingVideoDataset(Dataset):
         window_post_s: float = 0.25,
         kinematics_settings: Optional[dict] = None,
         kinematics_compute_if_missing: bool = False,
+        require_onset: bool = False,
     ):
+        self.n_onset_fallback = 0
+        if sampling_mode == "onset_window":
+            lacking = [r for r in samples if not _has_onset(r)]
+            if require_onset and lacking:
+                log.warning(
+                    f"Dropping {len(lacking)} of {len(samples)} clips without "
+                    "light_frame_in_clip/clip_fps (data.require_onset=true)"
+                )
+                samples = [r for r in samples if _has_onset(r)]
+            elif lacking:
+                self.n_onset_fallback = len(lacking)
+                log.warning(
+                    f"{len(lacking)} of {len(samples)} clips have no onset "
+                    "(light_frame_in_clip/clip_fps); they are sampled uniformly "
+                    "over the whole clip instead of the onset window "
+                    "(set data.require_onset=true to drop them)"
+                )
         self.samples = samples
         self.num_frames = num_frames
         self.transform = transform
