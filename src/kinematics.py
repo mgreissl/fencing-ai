@@ -8,6 +8,12 @@ Extracts physically grounded kinematic signals from fencer body poses (using YOL
 - Torso momentum (distinguishing advancing lunges from retreats/hesitations).
 - Mutual closure rate.
 
+Pipeline: pose on every frame of the clip -> person tracking with fixed
+left/right identities -> per-clip weapon side -> validity masks and short-gap
+interpolation -> derivatives with dt = 1 / fps. The result is a full-rate
+(T_clip, KINEMATIC_FEATURE_DIM) array; ``select_kinematic_frames`` picks the
+frame indices the video stream samples. See ``KINEMATIC_FEATURE_NAMES``.
+
 Also provides broadcast-style AR velocity glow rendering (Olympic "Fencing Visualized" style).
 """
 
@@ -34,9 +40,54 @@ R_ANKLE = 16
 
 _YOLO_MODEL = None
 
+# ---------------------------------------------------------------------------
+# Feature layout
+# ---------------------------------------------------------------------------
+# Per frame the feature vector is [left fencer | right fencer | pair].
+# "left"/"right" are identities fixed per clip (who starts on the left), not
+# per-frame positions. Positions are normalized to [0, 1] image coordinates,
+# velocities are in units per second (dt = 1 / fps). All entries of a block are
+# 0 when its validity channel is 0.
+FENCER_FEATURE_NAMES: tuple[str, ...] = (
+    "wrist_x",  # weapon wrist x
+    "wrist_y",  # weapon wrist y
+    "wrist_vx",  # d(wrist_x)/dt
+    "wrist_vy",  # d(wrist_y)/dt
+    "wrist_acc",  # log(1 + |d^2 wrist/dt^2|)
+    "extension",  # |weapon wrist - weapon shoulder| / torso height
+    "torso_x",  # hip midpoint x
+    "torso_vx",  # d(torso_x)/dt
+    "valid",  # 1 if detected (or gap-interpolated), else 0
+)
+PAIR_FEATURE_NAMES: tuple[str, ...] = (
+    "distance",  # right wrist_x - left wrist_x
+    "closure",  # -d(distance)/dt, > 0 when the fencers close in
+    "pair_valid",  # both fencers valid
+)
+FENCER_FEATURE_DIM = len(FENCER_FEATURE_NAMES)
+LEFT_OFFSET = 0
+RIGHT_OFFSET = FENCER_FEATURE_DIM
+PAIR_OFFSET = 2 * FENCER_FEATURE_DIM
+KINEMATIC_FEATURE_NAMES: tuple[str, ...] = (
+    tuple(f"left_{n}" for n in FENCER_FEATURE_NAMES)
+    + tuple(f"right_{n}" for n in FENCER_FEATURE_NAMES)
+    + PAIR_FEATURE_NAMES
+)
+KINEMATIC_FEATURE_DIM = len(KINEMATIC_FEATURE_NAMES)  # 21
+
+_F_VALID = FENCER_FEATURE_NAMES.index("valid")
+_F_X_POSITIONS = (FENCER_FEATURE_NAMES.index("wrist_x"), FENCER_FEATURE_NAMES.index("torso_x"))
+_F_X_VELOCITIES = (FENCER_FEATURE_NAMES.index("wrist_vx"), FENCER_FEATURE_NAMES.index("torso_vx"))
+
 # Settings that influence the extracted features. Every key is part of the
 # kinematics cache key, so changing any of them invalidates cached features.
 DEFAULT_KINEMATICS_SETTINGS: dict = {
+    "pose_model": "yolo11n-pose.pt",
+    "default_fps": 25.0,
+    "keypoint_conf_threshold": 0.3,
+    "max_gap": 5,
+    "smoothing_window": 5,
+    "smoothing_polyorder": 2,
     "track_max_age": 15,
     "track_max_distance": 0.75,
     "y_band": [0.30, 0.78],
@@ -509,171 +560,239 @@ def fill_short_gaps(
     return np.where(mask, values, 0.0), new_valid
 
 
-def _get_fencer_metrics(kpts: np.ndarray, is_left_fencer: bool) -> tuple[np.ndarray, np.ndarray, float]:
+# ---------------------------------------------------------------------------
+# Full-rate derivatives and feature assembly (#28)
+# ---------------------------------------------------------------------------
+
+
+def masked_derivative(
+    values: np.ndarray,
+    valid: np.ndarray,
+    fps: float,
+    order: int = 1,
+    smoothing_window: int = 0,
+    polyorder: int = 2,
+) -> np.ndarray:
     """
-    Extract lead wrist position, torso position, and torso scale for a fencer.
+    Time derivative with the true frame step ``dt = 1 / fps``, per valid run.
+
+    Derivatives are computed separately on every contiguous run of valid frames,
+    so invalid (zero) frames never enter a difference. With
+    ``smoothing_window >= 3`` and scipy available a Savitzky-Golay derivative
+    filter is used (window shrunk to fit short runs); otherwise ``np.gradient``
+    is applied ``order`` times. Runs of a single frame and invalid frames get 0.
 
     Args:
-        kpts: (17, 2) array of (x, y) coordinates normalized to [0, 1].
-        is_left_fencer: True if fencer is on the left facing right.
+        values: (T, ...) per-frame values.
+        valid: (T,) validity mask.
+        fps: frame rate of the series.
+        order: derivative order (1 = velocity, 2 = acceleration).
+        smoothing_window: Savitzky-Golay window in frames (0 or 1 disables).
+        polyorder: Savitzky-Golay polynomial order.
 
     Returns:
-        (lead_wrist_xy, torso_xy, torso_scale)
+        (T, ...) derivative in units per second**order.
     """
-    # Shoulder midpoint and hip midpoint
-    l_sh, r_sh = kpts[L_SHOULDER], kpts[R_SHOULDER]
-    l_hp, r_hp = kpts[L_HIP], kpts[R_HIP]
+    values = np.asarray(values, dtype=np.float64)
+    out = np.zeros_like(values)
+    dt = 1.0 / float(fps)
+    try:
+        from scipy.signal import savgol_filter
+    except ImportError:  # pragma: no cover - scipy is a declared dependency
+        savgol_filter = None
 
-    sh_mid = (l_sh + r_sh) / 2.0
-    hp_mid = (l_hp + r_hp) / 2.0
-    torso_scale = max(float(np.linalg.norm(sh_mid - hp_mid)), 0.05)
+    for start, stop in contiguous_runs(valid):
+        seg = values[start:stop]
+        n = stop - start
+        window = min(int(smoothing_window), n if n % 2 else n - 1)
+        if window % 2 == 0:
+            window -= 1
+        poly = min(polyorder, window - 1)
+        if savgol_filter is not None and window >= 3 and poly >= order:
+            out[start:stop] = savgol_filter(
+                seg, window, poly, deriv=order, delta=dt, axis=0, mode="interp"
+            )
+        elif n >= 2:
+            deriv = seg
+            for _ in range(order):
+                deriv = np.gradient(deriv, dt, axis=0)
+            out[start:stop] = deriv
+    return out
 
-    l_wr, r_wr = kpts[L_WRIST], kpts[R_WRIST]
 
-    # For Left fencer facing Right, lead wrist is the one with greater X (closest to opponent)
-    # For Right fencer facing Left, lead wrist is the one with smaller X
-    if is_left_fencer:
-        lead_wrist = r_wr if r_wr[0] > l_wr[0] else l_wr
-        shoulder = r_sh if r_wr[0] > l_wr[0] else l_sh
+def compute_kinematic_features(
+    tracks: FencerTracks, settings: Optional[dict] = None
+) -> np.ndarray:
+    """
+    Compute the full-rate (T, KINEMATIC_FEATURE_DIM) feature array from fencer tracks.
+
+    Pipeline per fencer: weapon wrist decided once per clip (majority vote),
+    per-frame signals with a validity mask, short gaps interpolated, then
+    derivatives with ``dt = 1 / fps`` on valid runs only. Invalid entries are 0
+    and flagged by the ``*_valid`` channels. See ``KINEMATIC_FEATURE_NAMES``.
+    """
+    cfg = resolve_kinematics_settings(settings)
+    fps = float(tracks.fps)
+    thr = cfg["keypoint_conf_threshold"]
+    deriv_kw = dict(
+        smoothing_window=cfg["smoothing_window"], polyorder=cfg["smoothing_polyorder"]
+    )
+
+    blocks, wrists_x, valids = [], [], []
+    for slot, facing in ((0, 1), (1, -1)):
+        kpts = tracks.keypoints[:, slot]
+        conf = tracks.keypoint_conf[:, slot]
+        detected = tracks.detected[:, slot]
+        weapon = determine_weapon_wrist(kpts, conf, detected, facing, thr)
+        sig = compute_fencer_signals(kpts, conf, detected, weapon, thr)
+
+        raw = np.concatenate([sig.wrist, sig.torso, sig.extension[:, None]], axis=1)
+        raw, valid = fill_short_gaps(raw, sig.valid, cfg["max_gap"])
+        wrist, torso_x, extension = raw[:, 0:2], raw[:, 2], raw[:, 4]
+
+        # v = dp/dt, a = d^2p/dt^2 with dt = 1/fps
+        wrist_v = masked_derivative(wrist, valid, fps, order=1, **deriv_kw)
+        wrist_a = masked_derivative(wrist, valid, fps, order=2, **deriv_kw)
+        torso_vx = masked_derivative(torso_x, valid, fps, order=1, **deriv_kw)
+        # log(1 + |a|) keeps impact spikes visible without dominating the input scale
+        wrist_acc = np.log1p(np.linalg.norm(wrist_a, axis=1))
+
+        blocks.append(
+            np.column_stack(
+                [wrist, wrist_v, wrist_acc, extension, torso_x, torso_vx, valid]
+            )
+        )
+        wrists_x.append(wrist[:, 0])
+        valids.append(valid)
+
+    pair_valid = valids[0] & valids[1]
+    distance = np.where(pair_valid, wrists_x[1] - wrists_x[0], 0.0)
+    closure = -masked_derivative(distance, pair_valid, fps, order=1, **deriv_kw)
+    pair = np.column_stack([distance, closure, pair_valid])
+
+    features = np.concatenate(blocks + [pair], axis=1).astype(np.float32)
+    assert features.shape[1] == KINEMATIC_FEATURE_DIM
+    return features
+
+
+def select_kinematic_frames(features: np.ndarray, indices: Sequence[int]) -> np.ndarray:
+    """
+    Pick the rows of a full-rate feature array that the video stream samples.
+
+    Indices are clamped to the valid range, so off-by-one differences between
+    video decoders do not crash. An empty feature array yields zeros
+    (all channels invalid).
+    """
+    idx = np.asarray(list(indices), dtype=np.int64)
+    if len(features) == 0:
+        return np.zeros((len(idx), features.shape[-1]), dtype=np.float32)
+    return np.asarray(features)[np.clip(idx, 0, len(features) - 1)]
+
+
+def _iter_bgr_frames(
+    frames_or_video_path: Union[str, os.PathLike, torch.Tensor, np.ndarray, Sequence[np.ndarray]],
+):
+    """Yield (H, W, 3) uint8 frames in the BGR order YOLO expects."""
+    src = frames_or_video_path
+    if isinstance(src, (str, os.PathLike)):
+        cap = cv2.VideoCapture(str(src))
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                yield frame
+        finally:
+            cap.release()
+    elif isinstance(src, torch.Tensor):
+        if src.dim() != 4:
+            raise ValueError(f"Unsupported tensor shape: {tuple(src.shape)}")
+        if src.shape[1] == 3:  # (T, C, H, W) -> (T, H, W, C)
+            src = src.permute(0, 2, 3, 1)
+        elif src.shape[-1] != 3:
+            raise ValueError(f"Unsupported tensor shape: {tuple(src.shape)}")
+        # Dataset tensors are RGB in [0, 1].
+        for f in src:
+            rgb = (f.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            yield np.ascontiguousarray(rgb[..., ::-1])
     else:
-        lead_wrist = l_wr if l_wr[0] < r_wr[0] else r_wr
-        shoulder = l_sh if l_wr[0] < r_wr[0] else r_sh
+        # numpy frames are passed through unchanged (OpenCV / BGR convention).
+        yield from src
 
-    # Extension: distance from shoulder to lead wrist normalized by torso height
-    extension = float(np.linalg.norm(lead_wrist - shoulder)) / torso_scale
 
-    return lead_wrist, hp_mid, extension
+def _video_fps(path: Union[str, os.PathLike]) -> float:
+    cap = cv2.VideoCapture(str(path))
+    try:
+        return float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    finally:
+        cap.release()
+
+
+def extract_pose_tracks(
+    frames_or_video_path: Union[str, os.PathLike, torch.Tensor, np.ndarray, Sequence[np.ndarray]],
+    pose_model=None,
+    fps: Optional[float] = None,
+    settings: Optional[dict] = None,
+    batch_size: int = 32,
+) -> FencerTracks:
+    """
+    Run pose estimation on every frame of a clip and track both fencers.
+
+    Args:
+        frames_or_video_path: a video file path (all frames are decoded), a
+            tensor (T, C, H, W) / (T, H, W, C) RGB in [0, 1], or uint8 BGR frames.
+        pose_model: YOLO pose model; loaded from ``settings["pose_model"]`` if None.
+        fps: frame rate; read from the video file if possible, else
+            ``settings["default_fps"]``.
+        settings: kinematics settings (see ``DEFAULT_KINEMATICS_SETTINGS``).
+        batch_size: frames per pose-model call.
+
+    Returns:
+        FencerTracks with one entry per frame.
+    """
+    cfg = resolve_kinematics_settings(settings)
+    if pose_model is None:
+        pose_model = get_pose_model(cfg["pose_model"])
+    if fps is None and isinstance(frames_or_video_path, (str, os.PathLike)):
+        fps = _video_fps(frames_or_video_path)
+    if not fps or fps <= 0:
+        fps = cfg["default_fps"]
+
+    detections: list[FrameDetections] = []
+    batch: list[np.ndarray] = []
+
+    def flush():
+        if batch:
+            results = pose_model(list(batch), verbose=False)
+            detections.extend(pose_results_to_detections(r) for r in results)
+            batch.clear()
+
+    for frame in _iter_bgr_frames(frames_or_video_path):
+        batch.append(frame)
+        if len(batch) >= batch_size:
+            flush()
+    flush()
+    return track_fencers(detections, fps=fps, settings=cfg)
 
 
 def extract_kinematic_features(
-    frames: Union[torch.Tensor, np.ndarray],
+    frames: Union[str, os.PathLike, torch.Tensor, np.ndarray, Sequence[np.ndarray]],
     pose_model=None,
+    fps: Optional[float] = None,
+    settings: Optional[dict] = None,
 ) -> np.ndarray:
     """
-    Extract a (T, 16) kinematic time-series from a sequence of T video frames.
+    Extract the full-rate (T, KINEMATIC_FEATURE_DIM) kinematic time-series.
 
-    Args:
-        frames: Tensor of shape (T, C, H, W) in [0, 1] or numpy (T, H, W, C) in [0, 255].
-        pose_model: Optional pre-loaded YOLO model.
-
-    Returns:
-        np.ndarray of shape (T, 16) with normalized kinematic features.
+    ``frames`` must be consecutive frames of a clip (or a video path); use
+    ``select_kinematic_frames`` afterwards to pick the frames the video stream
+    samples. Do not pass already-subsampled frames: derivatives assume
+    ``dt = 1 / fps`` between rows.
     """
-    if pose_model is None:
-        pose_model = get_pose_model()
-
-    # Convert frames to list of (H, W, 3) uint8 numpy arrays
-    if isinstance(frames, torch.Tensor):
-        if frames.dim() == 4 and frames.shape[1] == 3:  # (T, C, H, W)
-            np_frames = [
-                (f.permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
-                for f in frames
-            ]
-        elif frames.dim() == 4 and frames.shape[-1] == 3:  # (T, H, W, C)
-            np_frames = [(f.cpu().numpy() * 255.0).astype(np.uint8) for f in frames]
-        else:
-            raise ValueError(f"Unsupported tensor shape: {frames.shape}")
-    else:
-        np_frames = list(frames)
-
-    T = len(np_frames)
-    if T == 0:
-        return np.zeros((16, 16), dtype=np.float32)
-
-    H, W = np_frames[0].shape[:2]
-
-    # Run YOLO pose inference
-    results = pose_model(np_frames, verbose=False)
-
-    raw_left_wrist = np.zeros((T, 2), dtype=np.float32)
-    raw_right_wrist = np.zeros((T, 2), dtype=np.float32)
-    raw_left_torso = np.zeros((T, 2), dtype=np.float32)
-    raw_right_torso = np.zeros((T, 2), dtype=np.float32)
-    raw_left_ext = np.zeros(T, dtype=np.float32)
-    raw_right_ext = np.zeros(T, dtype=np.float32)
-
-    for t, r in enumerate(results):
-        if r.keypoints is None or len(r.keypoints.xy) == 0:
-            continue
-
-        # Filter detected persons to on-piste competitors
-        # (rejects foreground referee at y > 0.78 and background spectators at y < 0.35)
-        candidates = []
-        for b, k in zip(r.boxes, r.keypoints):
-            xyxy = b.xyxy[0].cpu().numpy()
-            h = xyxy[3] - xyxy[1]
-            center_x = (xyxy[0] + xyxy[2]) / (2.0 * max(W, 1))
-            center_y = (xyxy[1] + xyxy[3]) / (2.0 * max(H, 1))
-            if 0.30 <= center_y <= 0.78 and h >= 50:
-                kpts_norm = k.xy[0].cpu().numpy().copy()
-                kpts_norm[:, 0] /= max(W, 1)
-                kpts_norm[:, 1] /= max(H, 1)
-                candidates.append((center_x, h, kpts_norm))
-
-        if len(candidates) == 0:
-            continue
-
-        # Sort by horizontal position on the piste
-        candidates.sort(key=lambda c: c[0])
-        k_left = candidates[0][2]
-        k_right = candidates[-1][2] if len(candidates) > 1 else candidates[0][2]
-
-        l_wrist, l_torso, l_ext = _get_fencer_metrics(k_left, is_left_fencer=True)
-        r_wrist, r_torso, r_ext = _get_fencer_metrics(k_right, is_left_fencer=False)
-
-        raw_left_wrist[t] = l_wrist
-        raw_right_wrist[t] = r_wrist
-        raw_left_torso[t] = l_torso
-        raw_right_torso[t] = r_torso
-        raw_left_ext[t] = l_ext
-        raw_right_ext[t] = r_ext
-
-    # Compute first-order velocities (differences across time)
-    v_left_wrist = np.zeros_like(raw_left_wrist)
-    v_right_wrist = np.zeros_like(raw_right_wrist)
-    v_left_wrist[1:] = (raw_left_wrist[1:] - raw_left_wrist[:-1]) * 10.0  # scaled
-    v_right_wrist[1:] = (raw_right_wrist[1:] - raw_right_wrist[:-1]) * 10.0
-
-    # Compute accelerations (jerk/impulse spikes)
-    a_left_wrist = np.zeros(T, dtype=np.float32)
-    a_right_wrist = np.zeros(T, dtype=np.float32)
-    a_left_wrist[1:] = np.abs(v_left_wrist[1:, 0] - v_left_wrist[:-1, 0]) * 10.0
-    a_right_wrist[1:] = np.abs(v_right_wrist[1:, 0] - v_right_wrist[:-1, 0]) * 10.0
-
-    # Torso advance velocity (X component)
-    v_left_torso = np.zeros(T, dtype=np.float32)
-    v_right_torso = np.zeros(T, dtype=np.float32)
-    v_left_torso[1:] = (raw_left_torso[1:, 0] - raw_left_torso[:-1, 0]) * 10.0
-    v_right_torso[1:] = (raw_right_torso[1:, 0] - raw_right_torso[:-1, 0]) * 10.0
-
-    # Interaction: separation and closure rate
-    distance = raw_right_wrist[:, 0] - raw_left_wrist[:, 0]
-    closure = np.zeros(T, dtype=np.float32)
-    closure[1:] = (distance[:-1] - distance[1:]) * 10.0
-
-    # Assemble 16-dimensional feature vector per frame
-    # Left: [wrist_x, wrist_y, vx, vy, ax, ext, torso_vx] = 7
-    # Right: [wrist_x, wrist_y, vx, vy, ax, ext, torso_vx] = 7
-    # Interaction: [distance, closure] = 2
-    # Total = 16
-    features = np.column_stack(
-        [
-            raw_left_wrist,         # 2 (0, 1)
-            v_left_wrist,           # 2 (2, 3)
-            a_left_wrist,           # 1 (4)
-            raw_left_ext,           # 1 (5)
-            v_left_torso,           # 1 (6)
-            raw_right_wrist,        # 2 (7, 8)
-            v_right_wrist,          # 2 (9, 10)
-            a_right_wrist,          # 1 (11)
-            raw_right_ext,          # 1 (12)
-            v_right_torso,          # 1 (13)
-            distance,               # 1 (14)
-            closure,                # 1 (15)
-        ]
-    ).astype(np.float32)
-
-    return features
+    tracks = extract_pose_tracks(frames, pose_model=pose_model, fps=fps, settings=settings)
+    if tracks.num_frames == 0:
+        return np.zeros((0, KINEMATIC_FEATURE_DIM), dtype=np.float32)
+    return compute_kinematic_features(tracks, settings=settings)
 
 
 def render_velocity_trails(
@@ -805,26 +924,31 @@ def render_velocity_trails(
     return out_frames
 
 
-def flip_kinematic_features(kinematics: torch.Tensor) -> torch.Tensor:
+def flip_kinematic_features(
+    kinematics: Union[torch.Tensor, np.ndarray],
+) -> Union[torch.Tensor, np.ndarray]:
     """
-    Apply horizontal reflection to kinematic features tensor of shape (..., 16):
-    - Swaps Left fencer (indices 0..6) and Right fencer (indices 7..13).
-    - Reflects horizontal coordinates (x -> 1.0 - x) and velocities (vx -> -vx).
+    Horizontal reflection of kinematic features of shape (..., KINEMATIC_FEATURE_DIM).
+
+    - Swaps the left and right fencer blocks.
+    - Reflects positions (x -> 1 - x) of valid frames; invalid frames stay 0.
+    - Negates horizontal velocities (vx -> -vx).
+    - y, acceleration magnitude, extension, validity and the pair block
+      (distance, closure) are invariant.
+
+    Applying it twice returns the input. Works on torch tensors and numpy arrays.
     """
-    flipped = kinematics.clone()
-    left_feat = kinematics[..., :7].clone()
-    right_feat = kinematics[..., 7:14].clone()
-
-    # Reflect X position (0), X velocity (2), and torso X velocity (6)
-    left_feat[..., 0] = 1.0 - left_feat[..., 0]
-    left_feat[..., 2] = -left_feat[..., 2]
-    left_feat[..., 6] = -left_feat[..., 6]
-
-    right_feat[..., 0] = 1.0 - right_feat[..., 0]
-    right_feat[..., 2] = -right_feat[..., 2]
-    right_feat[..., 6] = -right_feat[..., 6]
-
-    flipped[..., :7] = right_feat
-    flipped[..., 7:14] = left_feat
+    is_torch = isinstance(kinematics, torch.Tensor)
+    flipped = kinematics.clone() if is_torch else np.array(kinematics, copy=True)
+    for src, dst in ((LEFT_OFFSET, RIGHT_OFFSET), (RIGHT_OFFSET, LEFT_OFFSET)):
+        block = kinematics[..., src : src + FENCER_FEATURE_DIM]
+        flipped[..., dst : dst + FENCER_FEATURE_DIM] = block
+        valid = block[..., _F_VALID] > 0.5
+        for i in _F_X_POSITIONS:
+            reflected = 1.0 - block[..., i]
+            zero = torch.zeros_like(reflected) if is_torch else np.zeros_like(reflected)
+            where = torch.where if is_torch else np.where
+            flipped[..., dst + i] = where(valid, reflected, zero)
+        for i in _F_X_VELOCITIES:
+            flipped[..., dst + i] = -block[..., i]
     return flipped
-
