@@ -17,8 +17,7 @@ import pytest
 
 from src.kinematics import (
     KINEMATIC_FEATURE_DIM,
-    kinematics_cache_path,
-    save_kinematics_atomic,
+    save_kinematics_cache,
 )
 from src.manifest import MANIFEST_COLUMNS
 
@@ -59,8 +58,9 @@ def _make_dataset(root: Path, cache_dir: Path) -> Path:
             n = 2 * i + j
             path = clips_dir / f"{LABELS[n % 3]}_foil_{match_id}_{j}.mp4"
             _write_clip(path, seed=n)
-            save_kinematics_atomic(
-                kinematics_cache_path(cache_dir, path),
+            save_kinematics_cache(
+                cache_dir,
+                path,
                 np.random.default_rng(n).normal(
                     size=(N_FRAMES_CLIP, KINEMATIC_FEATURE_DIM)
                 ).astype(np.float32),

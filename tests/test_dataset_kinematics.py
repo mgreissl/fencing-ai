@@ -77,3 +77,18 @@ def test_dataset_does_not_write_cache(patched, tmp_path):
     )
     ds[0]
     assert not cache.exists()
+
+
+@pytest.mark.parametrize("n_rows, ok", [(N_CLIP, True), (N_CLIP + 1, True), (N_CLIP - 1, True), (N_CLIP + 2, False), (N_CLIP - 5, False)])
+def test_feature_length_must_match_decoded_frames(monkeypatch, tmp_path, n_rows, ok):
+    full = np.zeros((n_rows, KINEMATIC_FEATURE_DIM), dtype=np.float32)
+    monkeypatch.setattr(dataset_module, "read_frames", _fake_read_frames)
+    monkeypatch.setattr(
+        dataset_module, "load_or_compute_kinematics", lambda *a, **k: full
+    )
+    ds = FencingVideoDataset([_record(tmp_path)], num_frames=4, use_kinematics=True)
+    if ok:
+        assert ds[0]["kinematics"].shape == (4, KINEMATIC_FEATURE_DIM)
+    else:
+        with pytest.raises(RuntimeError, match="a.mp4.*frames"):
+            ds[0]

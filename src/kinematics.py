@@ -20,6 +20,7 @@ Also provides broadcast-style AR velocity glow rendering (Olympic "Fencing Visua
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import time
@@ -30,6 +31,8 @@ import torch.nn as nn
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Union
+
+log = logging.getLogger(__name__)
 
 # COCO Keypoint indices
 NOSE = 0
@@ -173,6 +176,94 @@ def save_kinematics_atomic(path: Union[str, os.PathLike], array: np.ndarray) -> 
     return path
 
 
+class KinematicsCacheError(RuntimeError):
+    """A cached kinematics array does not belong to the current clip."""
+
+
+FPS_TOLERANCE = 0.01
+
+
+def kinematics_meta_path(cache_path: Union[str, os.PathLike]) -> Path:
+    """Sidecar metadata file of a cached array: ``{stem}.meta.json``."""
+    cache_path = Path(cache_path)
+    return cache_path.with_name(f"{cache_path.stem}.meta.json")
+
+
+def _build_kinematics_meta(clip_path: Union[str, os.PathLike], n_rows: int) -> dict:
+    """Facts about the clip the features were computed from."""
+    meta = {
+        "n_frames": int(n_rows),
+        "fps": None,
+        "clip_size": None,
+        "clip_mtime_ns": None,
+    }
+    clip = Path(clip_path)
+    if clip.is_file():
+        stat = clip.stat()
+        meta["clip_size"] = int(stat.st_size)
+        meta["clip_mtime_ns"] = int(stat.st_mtime_ns)
+        fps = _video_fps(clip)
+        meta["fps"] = float(fps) if fps and fps > 0 else None
+    return meta
+
+
+def _meta_mismatch(
+    meta: Optional[dict], clip_path: Union[str, os.PathLike], n_rows: int
+) -> Optional[str]:
+    """Why the cached array does not fit the clip, or None if it does.
+
+    The modification time is stored but not compared: copying a data set to
+    another machine changes it without changing the content.
+    """
+    if meta is None:
+        return "no metadata file (cache predates clip validation)"
+    if meta.get("n_frames") != n_rows:
+        return f"metadata says {meta.get('n_frames')} frames but array has {n_rows} rows"
+    clip = Path(clip_path)
+    if not clip.is_file():
+        return None
+    size = clip.stat().st_size
+    if meta.get("clip_size") is not None and meta["clip_size"] != size:
+        return f"clip size changed ({meta['clip_size']} -> {size} bytes)"
+    cached_fps = meta.get("fps")
+    if cached_fps:
+        fps = _video_fps(clip)
+        if fps and fps > 0 and abs(fps - cached_fps) > FPS_TOLERANCE:
+            return f"clip fps changed ({cached_fps} -> {fps})"
+    return None
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def save_kinematics_cache(
+    cache_dir: Union[str, os.PathLike],
+    clip_path: Union[str, os.PathLike],
+    array: np.ndarray,
+    settings: Optional[dict] = None,
+) -> Path:
+    """
+    Store ``array`` as the cache entry of a clip, with its sidecar metadata.
+
+    The array is written first and the metadata second (both atomically), so a
+    crash in between leaves an entry without metadata, which readers reject.
+    """
+    path = save_kinematics_atomic(kinematics_cache_path(cache_dir, clip_path, settings), array)
+    _write_json_atomic(kinematics_meta_path(path), _build_kinematics_meta(clip_path, len(array)))
+    return path
+
+
 def load_or_compute_kinematics(
     clip_path: Union[str, os.PathLike],
     cache_dir: Union[str, os.PathLike],
@@ -184,29 +275,49 @@ def load_or_compute_kinematics(
     Return the full-rate (T_clip, KINEMATIC_FEATURE_DIM) features of a clip.
 
     Loads ``kinematics_cache_path(cache_dir, clip_path, settings)`` if it holds a
-    readable array with the current layout; otherwise computes the features on
-    all frames of the clip and stores them with ``save_kinematics_atomic``.
-    Select the sampled frames afterwards with ``select_kinematic_frames``, so
-    the cache is independent of sampling mode and temporal jitter.
+    readable array with the current layout whose sidecar metadata (frame count,
+    fps, clip size; see ``kinematics_meta_path``) matches the clip; otherwise
+    computes the features on all frames of the clip and stores them with
+    ``save_kinematics_atomic``. Select the sampled frames afterwards with
+    ``select_kinematic_frames``, so the cache is independent of sampling mode
+    and temporal jitter.
 
     Args:
-        compute_if_missing: if False, raise ``FileNotFoundError`` instead of
-            running pose estimation (e.g. inside DataLoader workers).
+        compute_if_missing: if False, raise instead of running pose estimation
+            (e.g. inside DataLoader workers): ``FileNotFoundError`` when there
+            is no readable cache entry, ``KinematicsCacheError`` when the entry
+            does not match the clip (re-cut clip, other fps, no metadata).
+            If True, such an entry is recomputed with a warning.
     """
     path = kinematics_cache_path(cache_dir, clip_path, settings)
+    mismatch = None
     if path.exists():
         try:
             feats = np.load(path, allow_pickle=False)
             if feats.ndim == 2 and feats.shape[1] == KINEMATIC_FEATURE_DIM:
-                return feats.astype(np.float32, copy=False)
+                meta_path = kinematics_meta_path(path)
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    meta = None
+                mismatch = _meta_mismatch(meta, clip_path, len(feats))
+                if mismatch is None:
+                    return feats.astype(np.float32, copy=False)
         except (OSError, ValueError, EOFError):
             pass  # corrupt or truncated file: recompute below
     if not compute_if_missing:
+        if mismatch is not None:
+            raise KinematicsCacheError(
+                f"Stale kinematics cache {path}: {mismatch}; delete it and re-run "
+                "scripts/precompute_kinematics.py."
+            )
         raise FileNotFoundError(
             f"No kinematics cache at {path}; run scripts/precompute_kinematics.py first."
         )
+    if mismatch is not None:
+        log.warning(f"Recomputing stale kinematics cache {path}: {mismatch}")
     feats = extract_kinematic_features(clip_path, pose_model=pose_model, settings=settings)
-    save_kinematics_atomic(path, feats)
+    save_kinematics_cache(cache_dir, clip_path, feats, settings)
     return feats
 
 

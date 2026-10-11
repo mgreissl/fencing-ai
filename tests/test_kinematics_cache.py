@@ -160,3 +160,67 @@ def test_load_or_compute_replaces_corrupt_or_stale_file(tmp_path, fake_extract):
     feats = kin.load_or_compute_kinematics("L1.mp4", tmp_path)
     assert feats.shape[1] == kin.KINEMATIC_FEATURE_DIM
     assert len(fake_extract) == 2
+
+
+# --- cache metadata validation (#52) ----------------------------------------
+
+
+_CLIP_FPS = {"value": 30.0}
+
+
+@pytest.fixture
+def clip_file(tmp_path, monkeypatch):
+    clip = tmp_path / "clips" / "L1.mp4"
+    clip.parent.mkdir()
+    clip.write_bytes(b"x" * 100)
+    _CLIP_FPS["value"] = 30.0
+    monkeypatch.setattr(kin, "_video_fps", lambda path: _CLIP_FPS["value"])
+    return clip
+
+
+def test_cache_stores_metadata_next_to_array(tmp_path, fake_extract, clip_file):
+    import json
+
+    kin.load_or_compute_kinematics(clip_file, tmp_path / "cache")
+    path = kinematics_cache_path(tmp_path / "cache", clip_file)
+    meta = json.loads(kin.kinematics_meta_path(path).read_text())
+    assert meta["n_frames"] == 7
+    assert meta["fps"] == 30.0
+    assert meta["clip_size"] == 100
+    assert "clip_mtime_ns" in meta
+    assert _tmp_leftovers(path.parent) == []
+
+
+def test_valid_cache_is_loaded_without_recompute(tmp_path, fake_extract, clip_file):
+    cache = tmp_path / "cache"
+    kin.load_or_compute_kinematics(clip_file, cache)
+    kin.load_or_compute_kinematics(clip_file, cache, compute_if_missing=False)
+    assert len(fake_extract) == 1
+
+
+def test_cache_without_metadata_is_rejected(tmp_path, fake_extract, clip_file):
+    cache = tmp_path / "cache"
+    path = kinematics_cache_path(cache, clip_file)
+    kin.save_kinematics_atomic(path, np.zeros((7, kin.KINEMATIC_FEATURE_DIM), "f4"))
+    with pytest.raises(kin.KinematicsCacheError, match="metadata"):
+        kin.load_or_compute_kinematics(clip_file, cache, compute_if_missing=False)
+    kin.load_or_compute_kinematics(clip_file, cache)  # recompute allowed
+    assert len(fake_extract) == 1
+
+
+@pytest.mark.parametrize("change", ["size", "fps", "rows"])
+def test_stale_cache_is_rejected_or_recomputed(tmp_path, fake_extract, clip_file, change):
+    cache = tmp_path / "cache"
+    kin.load_or_compute_kinematics(clip_file, cache)
+    if change == "size":
+        clip_file.write_bytes(b"x" * 250)
+    elif change == "fps":
+        _CLIP_FPS["value"] = 25.0
+    else:
+        path = kinematics_cache_path(cache, clip_file)
+        kin.save_kinematics_atomic(path, np.zeros((9, kin.KINEMATIC_FEATURE_DIM), "f4"))
+    with pytest.raises(kin.KinematicsCacheError, match=change if change != "rows" else "rows"):
+        kin.load_or_compute_kinematics(clip_file, cache, compute_if_missing=False)
+    feats = kin.load_or_compute_kinematics(clip_file, cache)
+    assert len(fake_extract) == 2 and feats.shape[0] == 7
+    kin.load_or_compute_kinematics(clip_file, cache, compute_if_missing=False)  # fresh now

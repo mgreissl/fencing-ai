@@ -134,6 +134,9 @@ def _extract_label(filename: str) -> Optional[int]:
     return None
 
 
+# cv2 (pose) and decord/PyAV (video) may disagree by a frame on the clip length
+KINEMATIC_FRAME_TOLERANCE = 1
+
 SAMPLING_MODES = ("onset_window", "end_weighted", "uniform")
 
 
@@ -530,8 +533,10 @@ class FencingVideoDataset(Dataset):
         weapon_id = sample.weapon_id
 
         sampled: list[int] = []
+        decoded_total: list[int] = []
 
         def index_fn(total_frames: int) -> list[int]:
+            decoded_total[:] = [total_frames]
             sampled[:] = sample_frame_indices(
                 total_frames,
                 self.num_frames,
@@ -559,6 +564,13 @@ class FencingVideoDataset(Dataset):
                 settings=self.kinematics_settings,
                 compute_if_missing=self.kinematics_compute_if_missing,
             )
+            if abs(len(features) - decoded_total[0]) > KINEMATIC_FRAME_TOLERANCE:
+                raise RuntimeError(
+                    f"Kinematics for {path} have {len(features)} frames but the "
+                    f"clip has {decoded_total[0]} (tolerance "
+                    f"{KINEMATIC_FRAME_TOLERANCE}); the cache is stale, recompute it "
+                    "with scripts/precompute_kinematics.py"
+                )
             kinematics = torch.from_numpy(
                 select_kinematic_frames(features, sampled)
             ).float()
