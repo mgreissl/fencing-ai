@@ -15,9 +15,16 @@ The HTML embeds each clip as <video controls> so a human can review and fill the
 import argparse
 import csv
 import logging
+import sys
 from pathlib import Path
 from typing import Optional
 import numpy as np
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 from src.manifest import (
     LABEL_MAP,
@@ -26,11 +33,6 @@ from src.manifest import (
     load_weapon_records,
     write_manifest,
 )
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def stratified_sample(
