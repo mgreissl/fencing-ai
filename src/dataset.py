@@ -6,8 +6,10 @@ from typing import Callable, Optional
 
 import numpy as np
 import torch
-from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
+
+from src.manifest import ClipRecord, load_weapon_records, merge_records
+from src.splits import stratified_subset
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +83,43 @@ def _read_video(path: str, indices: list[int]) -> torch.Tensor:
     return _read_video_pyav(path, indices)
 
 
+def read_frames(
+    path: str, index_fn: Callable[[int], list[int]]
+) -> torch.Tensor:
+    """
+    Open a video once, choose indices from its frame count, and read them.
+
+    Args:
+        path: Video file.
+        index_fn: Maps the total frame count to the list of indices to read.
+
+    Returns:
+        Tensor of shape (T, C, H, W) with values in [0, 1] float32.
+    """
+    if DECORD_AVAILABLE:
+        vr = VideoReader(path, ctx=cpu(0))
+        indices = index_fn(len(vr))
+        arr = vr.get_batch(indices).asnumpy()  # (T, H, W, C) uint8
+        return torch.from_numpy(arr).permute(0, 3, 1, 2).float() / 255.0
+
+    import av
+
+    container = av.open(path)
+    try:
+        decoded = [
+            f.to_ndarray(format="rgb24")
+            for f in container.decode(container.streams.video[0])
+        ]
+    finally:
+        container.close()
+    if not decoded:
+        raise RuntimeError(f"No frames decoded from {path}")
+    total = len(decoded)
+    selected = [decoded[min(i, total - 1)] for i in index_fn(total)]
+    arr = np.stack(selected)
+    return torch.from_numpy(arr).permute(0, 3, 1, 2).float() / 255.0
+
+
 def _extract_label(filename: str) -> Optional[int]:
     """
     Extract the class label from a clip filename.
@@ -94,17 +133,29 @@ def _extract_label(filename: str) -> Optional[int]:
     return None
 
 
-def _sample_frame_indices(
+SAMPLING_MODES = ("onset_window", "end_weighted", "uniform")
+
+
+def sample_frame_indices(
     total_frames: int,
     num_frames: int,
-    sampling_mode: str = "end_weighted",
+    sampling_mode: str = "onset_window",
     temporal_jitter: bool = False,
     max_shift: int = 1,
+    onset_frame: Optional[float] = None,
+    clip_fps: Optional[float] = None,
+    window_pre_s: float = 1.0,
+    window_post_s: float = 0.25,
+    rng: Optional[random.Random] = None,
 ) -> list[int]:
     """
     Sample `num_frames` frame indices from a video of `total_frames`.
 
-    Supports two modes:
+    Modes:
+    - 'onset_window': uniformly spaced frames over
+      [onset - window_pre_s, onset + window_post_s] (seconds, via `clip_fps`)
+      around the light onset frame. Falls back to 'uniform' if the onset or
+      fps is unknown or the onset lies outside the clip.
     - 'end_weighted': Samples fewer frames from the preparation phase (first half)
       and densely from the attack/blade clash phase (second half).
     - 'uniform': Uniformly spaces frames across the entire clip.
@@ -112,13 +163,22 @@ def _sample_frame_indices(
     Args:
         total_frames: Total number of frames in the video.
         num_frames: Desired number of frames to sample.
-        sampling_mode: 'end_weighted' or 'uniform'.
+        sampling_mode: 'onset_window' | 'end_weighted' | 'uniform'.
         temporal_jitter: If True, add random offset to the sampling.
         max_shift: Maximum frames to shift for temporal jitter.
+        onset_frame: Frame index of the light onset within the clip.
+        clip_fps: Frame rate of the clip (converts seconds to frames).
+        window_pre_s: Seconds before the onset included in the window.
+        window_post_s: Seconds after the onset included in the window.
+        rng: Optional random.Random used for jitter (default: global random).
 
     Returns:
-        Sorted list of frame indices.
+        Sorted list of `num_frames` frame indices within [0, total_frames).
     """
+    if sampling_mode not in SAMPLING_MODES:
+        raise ValueError(
+            f"sampling_mode must be one of {SAMPLING_MODES}, got {sampling_mode!r}"
+        )
     if total_frames <= 0:
         return list(range(num_frames))
 
@@ -130,9 +190,23 @@ def _sample_frame_indices(
 
     offset = 0
     if temporal_jitter:
-        offset = random.randint(-max_shift, max_shift)
+        offset = (rng or random).randint(-max_shift, max_shift)
 
-    if sampling_mode == "end_weighted":
+    mode = sampling_mode
+    if mode == "onset_window":
+        if (
+            onset_frame is None
+            or clip_fps is None
+            or clip_fps <= 0
+            or not 0 <= onset_frame < total_frames
+        ):
+            mode = "uniform"
+
+    if mode == "onset_window":
+        start = onset_frame - window_pre_s * clip_fps + offset
+        end = onset_frame + window_post_s * clip_fps + offset
+        indices = [int(round(x)) for x in np.linspace(start, end, num_frames)]
+    elif mode == "end_weighted":
         half = total_frames // 2
         n_early = 4
         n_late = num_frames - n_early  # 12 dense frames
@@ -149,6 +223,10 @@ def _sample_frame_indices(
     # Clamp to valid range and sort
     indices = sorted([max(0, min(i, total_frames - 1)) for i in indices])
     return indices
+
+
+# Backwards-compatible alias (used by scripts/precompute_kinematics.py)
+_sample_frame_indices = sample_frame_indices
 
 
 def _get_total_frames(path: str) -> int:
@@ -180,27 +258,34 @@ def discover_clips(
     include_flipped: bool = False,
     flipped_dir: Optional[str] = None,
     max_clips: Optional[int] = None,
-) -> list[tuple[str, int, int]]:
+    seed: int = 42,
+    validate: bool = True,
+) -> list[ClipRecord]:
     """
-    Discover labelled .mp4 clips for specified weapon(s).
+    Discover labelled clips for specified weapon(s).
+
+    Uses ``manifest.csv`` in each clip directory when present; otherwise
+    falls back to scanning ``*.mp4`` and parsing filenames.
 
     Args:
         clips_dir: Primary directory containing labelled clips (or defaults to data/clips/<weapon>).
         weapon: 'foil' | 'sabre' | 'epee' | 'multi' | 'all'.
         include_flipped: Whether to include legacy flipped directory.
         flipped_dir: Optional legacy directory containing pre-flipped clips.
-        max_clips: Maximum number of clips to return.
+        max_clips: Size of a label-stratified random subset (None/0 = all).
+        seed: Seed for the max_clips subset.
+        validate: Drop clips that are missing or cannot be decoded (see
+            `filter_readable_clips`).
 
     Returns:
-        List of (filepath, label_int, weapon_id_int) tuples.
+        List of ClipRecord.
     """
-    samples = []
+    per_dir: list[list[ClipRecord]] = []
     base_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     weapons_to_load = ["foil", "sabre", "epee"] if weapon in ["multi", "all"] else [weapon.lower()]
 
     for w in weapons_to_load:
-        w_id = WEAPON_MAP.get(w, 0)
         target_dirs = []
 
         if clips_dir and os.path.isdir(clips_dir) and len(weapons_to_load) == 1:
@@ -221,115 +306,83 @@ def discover_clips(
 
         w_count = 0
         for directory in target_dirs:
-            for fname in sorted(os.listdir(directory)):
-                if not fname.lower().endswith(".mp4"):
-                    continue
-                label = _extract_label(fname)
-                if label is not None:
-                    samples.append((os.path.join(directory, fname), label, w_id))
-                    w_count += 1
+            recs = load_weapon_records(directory, w)
+            w_count += len(recs)
+            per_dir.append(recs)
 
-        log.info(f"Loaded {w_count} clips for weapon: {w.upper()} (ID={w_id})")
+        log.info(f"Loaded {w_count} clips for weapon: {w.upper()}")
+
+    samples = merge_records(per_dir)
 
     if not samples:
-        log.warning(f"No labelled .mp4 clips found for weapon: {weapon}")
+        log.warning(f"No labelled clips found for weapon: {weapon}")
 
     if max_clips is not None and max_clips > 0:
-        samples = samples[:max_clips]
+        samples = stratified_subset(samples, max_clips, seed=seed)
+    if validate:
+        samples = filter_readable_clips(samples)
 
     log.info(
         f"Total discovered clips: {len(samples)} "
-        f"(L={sum(1 for _, l, _ in samples if l == 0)}, "
-        f"T={sum(1 for _, l, _ in samples if l == 1)}, "
-        f"R={sum(1 for _, l, _ in samples if l == 2)})"
+        f"(L={sum(1 for r in samples if r.label == 'L')}, "
+        f"T={sum(1 for r in samples if r.label == 'T')}, "
+        f"R={sum(1 for r in samples if r.label == 'R')})"
     )
     return samples
 
 
-def _get_base_clip_id(path: str) -> str:
-    """Extract a unique clip identifier ignoring -flipped and leading class letter."""
-    fname = os.path.basename(path)
-    clean = fname.replace("-flipped.mp4", "").replace(".mp4", "")
-    return clean[1:] if len(clean) > 1 else clean
-
-
-def make_splits(
-    samples: list[tuple[str, int, int]],
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
-    seed: int = 42,
-) -> tuple[list, list, list]:
+def filter_readable_clips(records: list[ClipRecord]) -> list[ClipRecord]:
     """
-    Group-aware stratified train/val/test split.
+    Drop clips that are missing or cannot be decoded; warn about each.
 
-    Returns:
-        Tuple of (train_samples, val_samples, test_samples).
+    Runs once at dataset build. Clips whose manifest provides `n_frames` are
+    only checked for existence; others are opened once to read the frame count.
     """
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6
-
-    from collections import defaultdict
-
-    groups = defaultdict(list)
-    base_id_labels = {}
-    for item in samples:
-        path, label = item[0], item[1]
-        bid = _get_base_clip_id(path)
-        groups[bid].append(item)
-        if "-flipped" not in path:
-            base_id_labels[bid] = label
-        elif bid not in base_id_labels:
-            base_id_labels[bid] = label
-
-    unique_bids = sorted(list(groups.keys()))
-    bid_labels = [base_id_labels[bid] for bid in unique_bids]
-
-    # First split: train vs (val+test)
-    test_val_ratio = val_ratio + test_ratio
-    train_bids, rest_bids, train_lbls, rest_lbls = train_test_split(
-        unique_bids,
-        bid_labels,
-        test_size=test_val_ratio,
-        stratify=bid_labels,
-        random_state=seed,
-    )
-
-    # Second split: val vs test
-    relative_test = test_ratio / test_val_ratio
-    val_bids, test_bids, _, _ = train_test_split(
-        rest_bids,
-        rest_lbls,
-        test_size=relative_test,
-        stratify=rest_lbls,
-        random_state=seed,
-    )
-
-    train_samples = [s for bid in train_bids for s in groups[bid]]
-    val_samples = [s for bid in val_bids for s in groups[bid]]
-    test_samples = [s for bid in test_bids for s in groups[bid]]
-
-    log.info(
-        f"Group-aware split ({len(unique_bids)} base clips): "
-        f"train={len(train_samples)}, val={len(val_samples)}, test={len(test_samples)}"
-    )
-    return train_samples, val_samples, test_samples
+    valid: list[ClipRecord] = []
+    dropped = 0
+    for rec in records:
+        path = rec.abs_path()
+        reason = None
+        if not os.path.isfile(path):
+            reason = "file not found"
+        elif rec.n_frames is None:
+            try:
+                if _get_total_frames(path) <= 0:
+                    reason = "no frames"
+            except Exception as exc:  # decoder errors are backend specific
+                reason = f"unreadable ({exc})"
+        elif rec.n_frames <= 0:
+            reason = "manifest n_frames <= 0"
+        if reason is None:
+            valid.append(rec)
+        else:
+            dropped += 1
+            log.warning(f"Dropping clip {rec.clip_path}: {reason}")
+    if dropped:
+        log.warning(f"Dropped {dropped} unusable clips; {len(valid)} remain")
+    return valid
 
 
 class FencingVideoDataset(Dataset):
     """
     PyTorch Dataset for fencing video clips.
+
+    `samples` is a list of `ClipRecord`. A clip that cannot be decoded raises
+    a RuntimeError (no silent zero-frame substitution).
     """
 
     def __init__(
         self,
-        samples: list,
+        samples: list[ClipRecord],
         num_frames: int = 16,
         transform: Optional[Callable] = None,
-        sampling_mode: str = "end_weighted",
+        sampling_mode: str = "onset_window",
         temporal_jitter: bool = False,
         max_shift: int = 1,
         use_kinematics: bool = False,
         kinematics_cache_dir: str = "data/kinematics",
+        window_pre_s: float = 1.0,
+        window_post_s: float = 0.25,
     ):
         self.samples = samples
         self.num_frames = num_frames
@@ -339,33 +392,35 @@ class FencingVideoDataset(Dataset):
         self.max_shift = max_shift
         self.use_kinematics = use_kinematics
         self.kinematics_cache_dir = kinematics_cache_dir
+        self.window_pre_s = window_pre_s
+        self.window_post_s = window_post_s
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
-        if len(sample) == 3:
-            path, label, weapon_id = sample
-        else:
-            path, label = sample[0], sample[1]
-            weapon_id = 0
+        path = sample.abs_path()
+        label = sample.label_id
+        weapon_id = sample.weapon_id
 
-        try:
-            total_frames = _get_total_frames(path)
-            indices = _sample_frame_indices(
+        def index_fn(total_frames: int) -> list[int]:
+            return sample_frame_indices(
                 total_frames,
                 self.num_frames,
                 sampling_mode=self.sampling_mode,
                 temporal_jitter=self.temporal_jitter,
                 max_shift=self.max_shift,
+                onset_frame=sample.light_frame_in_clip,
+                clip_fps=sample.clip_fps,
+                window_pre_s=self.window_pre_s,
+                window_post_s=self.window_post_s,
             )
-            frames = _read_video(path, indices)
+
+        try:
+            frames = read_frames(path, index_fn)  # opens the video once
         except Exception as e:
-            log.error(f"Error reading video {path}: {e}")
-            frames = torch.zeros(
-                self.num_frames, 3, 224, 224, dtype=torch.float32
-            )
+            raise RuntimeError(f"Failed to read video {path}: {e}") from e
 
         # Kinematic feature extraction & caching
         kinematics = None
