@@ -11,6 +11,7 @@ Processes match video URLs from {weapon}_videos.txt:
 """
 
 import argparse
+import math
 import os
 import sys
 import cv2
@@ -32,8 +33,32 @@ SCORE_CLASSIFIER = overlay.load_digit_classifier(cfg=OVERLAY)
 
 FFMPEG_BIN = "ffmpeg"
 FPS = 13
-JUMP_LENGTH = 260
-HIDE_LENGTH = 200
+# Raw cut geometry in seconds (frame counts depend on the source fps).
+JUMP_S = 10.4   # raw cut length and skip after a light
+HIDE_S = 8.0    # raw cut starts this long before the light
+INTRO_S = 60.0  # skipped at the start of every match video
+MIN_VIDEO_S = 100.0
+
+
+def validate_source_fps(fps):
+    """Return fps as float if plausible, else None (never assume 25)."""
+    try:
+        fps = float(fps)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(fps) or not 5.0 <= fps <= 120.0:
+        return None
+    return fps
+
+
+def frame_to_seconds(frame_index, fps):
+    """Source frame index to seconds."""
+    return frame_index / fps
+
+
+def seconds_to_frames(seconds, fps):
+    """Seconds to the nearest source frame count."""
+    return int(round(seconds * fps))
 
 
 def check_lights(frame, weapon="foil"):
@@ -82,14 +107,21 @@ def process_video_file(vid_path, output_dir, weapon="foil"):
     vid_name = os.path.splitext(os.path.basename(vid_path))[0]
     cap = cv2.VideoCapture(vid_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = validate_source_fps(cap.get(cv2.CAP_PROP_FPS))
     cap.release()
 
-    if total_frames < 2500:
+    if fps is None:
+        print(f"Video {vid_name} has no valid fps, skipping.")
+        return 0
+
+    if total_frames < seconds_to_frames(MIN_VIDEO_S, fps):
         print(f"Video {vid_name} too short ({total_frames} frames), skipping.")
         return 0
 
-    cap_end_point = total_frames - JUMP_LENGTH
-    position = 1500  # Skip intro
+    jump_frames = seconds_to_frames(JUMP_S, fps)
+    hide_frames = seconds_to_frames(HIDE_S, fps)
+    cap_end_point = total_frames - jump_frames
+    position = seconds_to_frames(INTRO_S, fps)  # Skip intro
     raw_clips = []
     clip_count = 0
 
@@ -120,13 +152,13 @@ def process_video_file(vid_path, output_dir, weapon="foil"):
             clip_count += 1
             raw_clips.append(out_clip)
 
-            # Extract 260 frames (~10s) starting 200 frames before the light
-            clip_start_frame = max(0, position - HIDE_LENGTH)
+            # Extract ~10 s starting ~8 s before the light
+            clip_start_frame = max(0, position - hide_frames)
             cmd = [
                 FFMPEG_BIN, "-y",
-                "-ss", str(clip_start_frame / 25.0),
+                "-ss", str(frame_to_seconds(clip_start_frame, fps)),
                 "-i", vid_path,
-                "-t", str(JUMP_LENGTH / 25.0),
+                "-t", str(JUMP_S),
                 "-r", str(FPS),
                 "-s", "640x360",
                 "-c:v", "libx264",
@@ -136,7 +168,7 @@ def process_video_file(vid_path, output_dir, weapon="foil"):
             sp.run(cmd, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
 
             # Jump forward
-            position += JUMP_LENGTH
+            position += jump_frames
             cap.set(cv2.CAP_PROP_POS_FRAMES, position)
 
     cap.release()
