@@ -1,0 +1,7 @@
+# @package _global_
+# Ablation: video_kinematics (all other settings as in default.yaml)
+model:
+  use_video: true
+  use_kinematics: true
+wandb:
+  run_name: video_kinematics

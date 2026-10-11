@@ -66,6 +66,16 @@ model:
   # HuggingFace model identifier
   backbone: "MCG-NJU/videomae-base-finetuned-kinetics"
 
+  # Video stream on/off. false = kinematics-only (no backbone is loaded;
+  # requires use_kinematics: true). See configs/experiment/ for ablations.
+  use_video: true
+
+  # Explicit VideoMAEConfig kwargs (e.g. hidden_size, num_hidden_layers,
+  # image_size, patch_size, tubelet_size, num_frames). When set, a randomly
+  # initialised backbone is built from it instead of loading `backbone`
+  # (no download; for smoke tests).
+  backbone_config: null
+
   # Freeze the backbone base
   freeze_backbone: true
 

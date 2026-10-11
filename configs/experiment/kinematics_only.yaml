@@ -1,0 +1,7 @@
+# @package _global_
+# Ablation: kinematics_only (all other settings as in default.yaml)
+model:
+  use_video: false
+  use_kinematics: true
+wandb:
+  run_name: kinematics_only
